@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anomaly Detector Dashboard</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #0056b3; text-align: center;}
+        .flash { padding: 10px; margin-bottom: 15px; border-radius: 5px; }
+        .flash.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .flash.warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .flash.danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        form { margin-top: 20px; padding: 20px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; }
+        input[type="file"] { margin-bottom: 10px; }
+        input[type="submit"] { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        input[type="submit"]:hover { background-color: #0056b3; }
+        p { margin-top: 15px; font-size: 0.9em; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Network Anomaly Detection Dashboard</h1>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <ul class="flashes">
+                {% for category, message in messages %}
+                    <li class="flash {{ category }}">{{ message }}</li>
+                {% endfor %}
+                </ul>
+            {% endif %}
+        {% endwith %}
+
+        <form action="/predict" method="post" enctype="multipart/form-data">
+            <label for="file">Upload PCAP file for prediction:</label><br><br>
+            <input type="file" name="file" id="file" accept=".csv, .pcap"><br><br>
+            <input type="submit" value="Analyze Traffic">
+        </form>
+
+        <p>
+            The PCAP file should contain network flow data with the same numerical features
+            as your training data. Non-feature columns (like 'Flow ID', 'Source IP', 'Label')
+            will be ignored.
+        </p>
+    </div>
+</body>
+</html>
