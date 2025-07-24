@@ -182,8 +182,8 @@ fabric.properties
 .idea/caches/build_file_checksums.ser
 
 # idea folder, uncomment if you don't need it
- .idea/
+.idea/
 
- anaconda_projects/
- datasets/
- working/
+anaconda_projects/
+datasets/
+working/processed_data.csv

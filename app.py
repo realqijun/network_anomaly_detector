@@ -11,8 +11,8 @@ from anomaly_detector_service import AnomalyDetector, EXPECTED_FEATURES_CICFLOWM
 from pcap_parser import parse_pcap_to_dataframe
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_secret_key_here' # Change this to a strong, random key!
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Max upload size: 100MB for PCAP files
+app.config['SECRET_KEY'] = os.urandom(24).hex()
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 detector = None
 
@@ -70,9 +70,8 @@ def predict():
                 file.save(tmp_file.name)
                 tmp_pcap_path = tmp_file.name # Store path for cleanup
 
-            # Use the PCAP parser to convert to DataFrame
             # CICFlowMeter needs an output directory for its generated CSVs
-            pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output') # Use app's root path for temp output
+            pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output')
             df_to_predict = parse_pcap_to_dataframe(tmp_pcap_path, pcap_output_dir, EXPECTED_FEATURES_CICFLOWMETER)
 
             if df_to_predict.empty:
