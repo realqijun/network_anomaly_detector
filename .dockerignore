@@ -1,0 +1,9 @@
+datasets/
+.gitignore
+.gitattributes
+train.py
+parser.py
+test.pcap
+detector.py
+.ipynb_checkpoints/
+.idea/
