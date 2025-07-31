@@ -3,27 +3,34 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Prediction Results</title>
+    <title>Anomaly Detection Results</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
-        .container { max-width: 1000px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h1 { color: #0056b3; }
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 20px; background-color: #eef2f7; color: #34495e; line-height: 1.6; }
+        .container { max-width: 1200px; margin: 40px auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0,0,0,0.1); }
+        h1 { color: #0056b3; text-align: center; }
+        .flashes { list-style: none; padding: 0; margin-bottom: 25px; text-align: center; }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        tr:nth-child(even) { background-color: #f9f9f9; }
-        .anomaly { background-color: #ffe6e6; } /* Light red for anomalies */
-        .benign { background-color: #e6ffe6; } /* Light green for benign */
-        .back-link { display: block; margin-top: 20px; color: #007bff; text-decoration: none; }
-        .back-link:hover { text-decoration: underline; }
-        .flash { padding: 10px; margin-bottom: 15px; border-radius: 5px; }
+        th, td { border: 1px solid #e0e0e0; padding: 12px 15px; text-align: left; }
+        th { background-color: #f0f4f7; color: #555; font-weight: 600; text-transform: uppercase; font-size: 0.9em; }
+        .anomaly { background-color: #ffe6e6 !important; }
+        .benign { background-color: #e6ffe6 !important; }
+        .anomaly-score-note { font-size: 0.85em; color: #e74c3c; margin-top: 10px; text-align: center; padding: 10px; background-color: #FCF0F0; border-left: 5px solid #e74c3c; border-radius: 4px; }
+        .anomaly-score-note strong { font-weight: 700; }
+        .flash { padding: 12px 20px; margin: 10px auto; border-radius: 8px; font-weight: 500; font-size: 0.95em; max-width: 90%; display: inline-block; }
         .flash.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .flash.danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; border-bottom: 1px solid #f5c6cb; }
+        .flash.danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .flash.warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .summary-box { background-color: #f7f9fc;  border: 1px solid #e1e7f0; border-radius: 8px; padding: 20px 25px; margin-bottom: 30px; display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 15px; }
+        .summary-item { text-align: center; padding: 10px; flex-grow: 1; min-width: 150px; }
+        .summary-item strong { display: block; font-size: 1.8em; color: #3498db; margin-bottom: 5px; }
+        .summary-item span { font-size: 0.9em; color: #666; }
+        .summary-item.anomalies strong { color: #e74c3c; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Prediction Results</h1>
+        <h1>Anomaly Detection Results</h1>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
@@ -34,6 +41,29 @@
                 </ul>
             {% endif %}
         {% endwith %}
+
+        <div class="summary-box">
+            <div class="summary-item">
+                <strong>{{ total_samples }}</strong>
+                <span>Total Samples Analyzed</span>
+            </div>
+            <div class="summary-item anomalies">
+                <strong>{{ total_anomalies }}</strong>
+                <span>Anomalies Detected</span>
+            </div>
+            <div class="summary-item">
+                <strong>{{ anomaly_frequency }}%</strong>
+                <span>Anomaly Percentage</span>
+            </div>
+        </div>
+
+        {% if total_anomalies > 0 and results and results[0].score|float > 1000 %}
+        <p class="anomaly-score-note">
+            <strong>Note on Anomaly Scores:</strong> The detected anomaly scores appear unusually large.
+            This may indicate an issue with feature scaling or the model's output in the backend.
+        </p>
+        {% endif %}
+
 
         <table>
             <thead>
@@ -54,7 +84,9 @@
             </tbody>
         </table>
 
-        <a href="{{ url_for('index') }}" class="back-link">Analyze another file</a>
+        <div class="button-group">
+            <a href="{{ url_for('index') }}" class="action-button">Analyze another file</a>
+        </div>
     </div>
 </body>
 </html>

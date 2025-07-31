@@ -27,7 +27,7 @@ with torch.no_grad():
     mse = torch.mean((X_tensor - reconstructed) ** 2, dim=1).numpy()
 
 # --- NEW: Calculate optimal threshold on the full dataset ---
-if len(np.unique(y_true)) > 1: # Ensure both classes are present for ROC calculation
+if len(np.unique(y_true)) > 1:
     fpr, tpr, thresholds_roc_curve = roc_curve(y_true, mse)
     optimal_idx = np.argmax(tpr - fpr)
     optimal_threshold_for_full_data = thresholds_roc_curve[optimal_idx]
@@ -36,8 +36,8 @@ else:
     optimal_threshold_for_full_data = 0.0094
     print("Warning: Only one class found in y_true. Cannot calculate optimal threshold from ROC curve.")
 
-# threshold = np.load("working/optimal_threshold.npy").item()
-threshold = optimal_threshold_for_full_data
+threshold = np.load("working/optimal_threshold.npy").item()
+# threshold = optimal_threshold_for_full_data
 
 y_pred = (mse > threshold).astype(int)
 

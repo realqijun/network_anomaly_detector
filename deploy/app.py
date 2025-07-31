@@ -1,6 +1,4 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
-import pandas as pd
-import io
 import os
 import sys
 import tempfile
@@ -49,62 +47,73 @@ def predict():
         flash('No selected file', 'warning')
         return redirect(url_for('index'))
 
-    # Determine file type based on extension
     file_extension = file.filename.split('.')[-1].lower()
 
     if file_extension not in ['csv', 'pcap', 'pcapng']:
         flash("Unsupported file type. Please upload a CSV, PCAP, or PCAPNG file.", "warning")
         return redirect(url_for('index'))
 
-    df_to_predict = pd.DataFrame() # Initialize empty DataFrame
-
     tmp_pcap_path = None
-
     try:
-        if file_extension == 'csv':
-            file_contents = file.read().decode('utf-8')
-            df_to_predict = pd.read_csv(io.StringIO(file_contents))
-        else: # PCAP or PCAPNG file
-            # Create a temporary file to save the uploaded PCAP
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
-                file.save(tmp_file.name)
-                tmp_pcap_path = tmp_file.name # Store path for cleanup
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
+            file.save(tmp_file.name)
+            tmp_pcap_path = tmp_file.name
 
-            # CICFlowMeter needs an output directory for its generated CSVs
-            pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output')
-            df_to_predict = parse_pcap_to_dataframe(tmp_pcap_path, pcap_output_dir, EXPECTED_FEATURES_CICFLOWMETER)
+        pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output')
+        os.makedirs(pcap_output_dir, exist_ok=True)
+        df_to_predict = parse_pcap_to_dataframe(tmp_pcap_path, pcap_output_dir, EXPECTED_FEATURES_CICFLOWMETER)
 
-            if df_to_predict.empty:
-                flash("PCAP file parsed, but no valid network flows were extracted.", "warning")
-                return redirect(url_for('index'))
+        if df_to_predict.empty:
+            flash("PCAP file parsed, but no valid network flows were extracted.", "warning")
+            return redirect(url_for('index'))
 
         # Ensure all expected feature columns are present, fill missing ones with 0 if they were not in the parsed data
         # This is important if the PCAP parser doesn't output all 78 features for some reason.
         for col in EXPECTED_FEATURES_CICFLOWMETER:
             if col not in df_to_predict.columns:
-                df_to_predict[col] = 0 # Fill missing columns with 0
+                df_to_predict[col] = 0.0 # Fill missing columns with 0
+
+        # print("\n--- DEBUG: df_to_predict before sending to detector ---")
+        # print("Columns:", df_to_predict.columns.tolist())
+        # print("Shape:", df_to_predict.shape)
+        # print("Data Types:\n", df_to_predict.dtypes)
+        # print("Head (first 5 rows):\n", df_to_predict.head())
+        # print("Describe (summary stats):\n", df_to_predict.describe())
+        # print("Check for NaNs (sum of NaNs per column):\n", df_to_predict.isnull().sum())
+        # print("Check for Infinities:\n", df_to_predict.isin([np.inf, -np.inf]).sum())
+        # print("--- END DEBUG: df_to_predict ---")
 
         # Call the predict method from your AnomalyDetector
         predictions, anomaly_scores = detector.predict(df_to_predict)
 
         results = []
-        for i in range(len(predictions)):
+        total_anomalies = 0
+        total_samples = len(predictions)
+        for i in range(total_samples):
+            if predictions[i] == 1: # 1 for anomaly
+                total_anomalies += 1
             results.append({
                 'index': i + 1,
                 'prediction': 'Anomaly' if predictions[i] == 1 else 'Benign',
-                'score': f"{anomaly_scores[i]:.6f}"
+                'score': f"{anomaly_scores[i]:.4f}"
             })
-
-        flash(f"Processed {len(predictions)} samples.", "success")
-        return render_template('results.html', results=results)
-
+        anomaly_frequency = (total_anomalies / total_samples * 100) if total_samples > 0 else 0.0
+        flash(f"Processed {total_samples} samples. Found {total_anomalies} ({anomaly_frequency:.2f}%) anomalies", "success")
+        return render_template('results.html',
+                               results=results,
+                               total_samples=total_samples,
+                               total_anomalies=total_anomalies ,
+                               anomaly_frequency=f"{anomaly_frequency:.2f}")
     except Exception as e:
         flash(f"Error processing file: {e}", "danger")
         return redirect(url_for('index'))
     finally:
-        # Clean up the temporary PCAP file if it was created
         if tmp_pcap_path and os.path.exists(tmp_pcap_path):
             os.remove(tmp_pcap_path)
+        # if 'pcap_output_dir' in locals() and os.path.exists(pcap_output_dir):
+        #     for f in os.listdir(pcap_output_dir):
+        #         os.remove(os.path.join(pcap_output_dir, f))
+        #     os.rmdir(pcap_output_dir)
 
     return redirect(url_for('index'))
 
@@ -119,4 +128,4 @@ if __name__ == '__main__':
     #     os.makedirs('tools')
     #     print("Created 'tools/' directory. Please place CICFlowMeter-5.1.jar inside it.")
 
-    app.run(debug=True)
+    app.run()

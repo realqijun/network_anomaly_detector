@@ -1,3 +1,5 @@
+import os
+
 import joblib
 import torch
 import pandas as pd
@@ -108,17 +110,18 @@ EXPECTED_FEATURES_CICFLOWMETER = [
     'act_data_pkt_fwd', 'min_seg_size_forward', 'Active Mean', 'Active Std',
     'Active Max', 'Active Min', 'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
 ]
+WORKING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'working')
 
 class AnomalyDetector:
-    def __init__(self, model_path="working/anomaly_detector_model.pth",
-                 scaler_path="working/min_max_scaler.pkl",
-                 threshold_path="working/optimal_threshold.npy",
+    def __init__(self, model_path=None,
+                 scaler_path=None,
+                 threshold_path=None,
                  feature_columns=None):
 
-        self.model_path = model_path
-        self.scaler_path = scaler_path
-        self.threshold_path = threshold_path
-        self.feature_columns = feature_columns
+        self.model_path = model_path if model_path else os.path.join(WORKING_DIR, "anomaly_detector_model.pth")
+        self.scaler_path = scaler_path if scaler_path else os.path.join(WORKING_DIR, "min_max_scaler.pkl")
+        self.threshold_path = threshold_path if threshold_path else os.path.join(WORKING_DIR, "optimal_threshold.npy")
+        self.feature_columns = feature_columns if feature_columns is not None else EXPECTED_FEATURES_CICFLOWMETER
 
         self.scaler = None
         self.model = None
@@ -132,8 +135,7 @@ class AnomalyDetector:
             self.scaler = joblib.load(self.scaler_path)
             print(f"Loaded scaler from {self.scaler_path}")
 
-            # Determine input_dim from scaler if feature_columns not explicitly provided
-            if self.feature_columns is None and hasattr(self.scaler, 'n_features_in_'):
+            if hasattr(self.scaler, 'n_features_in_') and self.scaler.n_features_in_ is not None:
                 self.input_dim = self.scaler.n_features_in_
             elif self.feature_columns is not None:
                  self.input_dim = len(self.feature_columns)
@@ -172,35 +174,40 @@ class AnomalyDetector:
         if raw_data_df.empty:
             return np.array([]), np.array([])
 
-        # 1. Select and process only feature columns
-        if self.feature_columns is None:
-            # If feature_columns not set, try to infer from data minus common non-features
-            # This is a fallback; it's safer to provide expected_features_columns
-            non_feature_cols = ['Flow ID', 'Source IP', 'Destination IP', 'Timestamp', 'Label']
-            inferred_feature_cols = [col for col in raw_data_df.columns if col not in non_feature_cols]
-            # Ensure the inferred columns match the scaler's expected input dimension
-            if len(inferred_feature_cols) != self.input_dim:
-                raise ValueError(f"Inferred feature columns ({len(inferred_feature_cols)}) do not match scaler's input dimension ({self.input_dim}). "
-                                 "Please explicitly define 'feature_columns' when initializing AnomalyDetector.")
-            processed_df = raw_data_df[inferred_feature_cols]
-        else:
-            # Ensure the input DataFrame has all expected feature columns
-            missing_cols = [col for col in self.feature_columns if col not in raw_data_df.columns]
-            if missing_cols:
-                raise ValueError(f"Input DataFrame is missing expected feature columns: {missing_cols}")
-            processed_df = raw_data_df[self.feature_columns]
+        processed_df = raw_data_df.copy()
+        for col in self.feature_columns:
+            if col not in processed_df.columns:
+                processed_df[col] = np.nan
 
-        processed_df = processed_df.apply(pd.to_numeric, errors='coerce')
-        processed_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        processed_df.dropna(inplace=True)
-
-        if processed_df.empty:
-            print("Warning: No valid numerical data left after preprocessing for prediction.")
+        features_df = processed_df[self.feature_columns]
+        features_df = features_df.apply(pd.to_numeric, errors='coerce')
+        features_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        features_df.fillna(0, inplace=True)
+        if features_df.empty:
+            print("Warning: No valid numerical data left after all preprocessing steps.")
             return np.array([]), np.array([])
 
-        scaled_data = self.scaler.transform(processed_df.values)
+        # print("\n--- DEBUG: features_df after cleaning (before scaling) ---")
+        # print("Columns:", features_df.columns.tolist())
+        # print("Shape:", features_df.shape)
+        # print("Data Types:\n", features_df.dtypes)
+        # print("Head (first 5 rows):\n", features_df.head())
+        # print("Describe (summary stats):\n", features_df.describe())
+        # print("Check for NaNs (should be 0):\n", features_df.isnull().sum().sum()) # Total NaNs
+        # print("Check for Infinities (should be 0):\n", features_df.isin([np.inf, -np.inf]).sum().sum()) # Total Infinities
+        # print("--- END DEBUG: features_df ---")
+
+        scaled_data = self.scaler.transform(features_df.values.astype(np.float32))
         scaled_tensor = torch.tensor(scaled_data, dtype=torch.float32)
 
+        # print("\n--- DEBUG: scaled_tensor (before model prediction) ---")
+        # print("Shape:", scaled_tensor.shape)
+        # print("Sample (first 5 rows):\n", scaled_tensor[:5])
+        # print(f"Min scaled value: {scaled_tensor.min().item()}")
+        # print(f"Max scaled value: {scaled_tensor.max().item()}")
+        # print(f"Mean scaled value: {scaled_tensor.mean().item()}")
+        # print(f"Std scaled value: {scaled_tensor.std().item()}")
+        # print("--- END DEBUG: scaled_tensor ---")
         with torch.no_grad():
             reconstructed_data = self.model(scaled_tensor)
             anomaly_scores = torch.mean((scaled_tensor - reconstructed_data) ** 2, dim=1).numpy()
