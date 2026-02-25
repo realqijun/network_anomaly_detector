@@ -186,4 +186,5 @@ fabric.properties
 
 anaconda_projects/
 datasets/
-working/processed_data.csv
+.DS_Store
+working/

@@ -72,18 +72,7 @@ def predict():
         for col in EXPECTED_FEATURES_CICFLOWMETER:
             if col not in df_to_predict.columns:
                 df_to_predict[col] = 0.0 # Fill missing columns with 0
-
-        # print("\n--- DEBUG: df_to_predict before sending to detector ---")
-        # print("Columns:", df_to_predict.columns.tolist())
-        # print("Shape:", df_to_predict.shape)
-        # print("Data Types:\n", df_to_predict.dtypes)
-        # print("Head (first 5 rows):\n", df_to_predict.head())
-        # print("Describe (summary stats):\n", df_to_predict.describe())
-        # print("Check for NaNs (sum of NaNs per column):\n", df_to_predict.isnull().sum())
-        # print("Check for Infinities:\n", df_to_predict.isin([np.inf, -np.inf]).sum())
-        # print("--- END DEBUG: df_to_predict ---")
-
-        # Call the predict method from your AnomalyDetector
+                
         predictions, anomaly_scores = detector.predict(df_to_predict)
 
         results = []

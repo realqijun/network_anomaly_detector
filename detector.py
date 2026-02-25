@@ -26,7 +26,7 @@ with torch.no_grad():
     reconstructed = model(X_tensor)
     mse = torch.mean((X_tensor - reconstructed) ** 2, dim=1).numpy()
 
-# --- NEW: Calculate optimal threshold on the full dataset ---
+# --- Calculate optimal threshold on the full dataset ---
 if len(np.unique(y_true)) > 1:
     fpr, tpr, thresholds_roc_curve = roc_curve(y_true, mse)
     optimal_idx = np.argmax(tpr - fpr)
