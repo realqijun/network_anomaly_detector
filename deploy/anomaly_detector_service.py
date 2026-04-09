@@ -110,6 +110,7 @@ EXPECTED_FEATURES_CICFLOWMETER = [
     'act_data_pkt_fwd', 'min_seg_size_forward', 'Active Mean', 'Active Std',
     'Active Max', 'Active Min', 'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
 ]
+
 WORKING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'working')
 
 class AnomalyDetector:

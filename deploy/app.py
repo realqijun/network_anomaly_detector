@@ -5,7 +5,7 @@ import tempfile
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from anomaly_detector_service import AnomalyDetector, EXPECTED_FEATURES_CICFLOWMETER
+from anomaly_detector_service import ConvAutoencoder, EXPECTED_FEATURES_CICFLOWMETER
 from pcap_parser import parse_pcap_to_dataframe
 
 app = Flask(__name__)
@@ -18,7 +18,7 @@ def load_detector():
     global detector
     if detector is None:
         try:
-            detector = AnomalyDetector(feature_columns=EXPECTED_FEATURES_CICFLOWMETER)
+            detector = ConvAutoencoder(feature_columns=EXPECTED_FEATURES_CICFLOWMETER)
             print("AnomalyDetector initialized successfully for Flask app.")
         except Exception as e:
             print(f"Error initializing AnomalyDetector: {e}. Please ensure 'working/' directory and models exist.")
@@ -72,7 +72,8 @@ def predict():
         for col in EXPECTED_FEATURES_CICFLOWMETER:
             if col not in df_to_predict.columns:
                 df_to_predict[col] = 0.0 # Fill missing columns with 0
-                
+
+        # Call the predict method from your AnomalyDetector
         predictions, anomaly_scores = detector.predict(df_to_predict)
 
         results = []
@@ -99,22 +100,12 @@ def predict():
     finally:
         if tmp_pcap_path and os.path.exists(tmp_pcap_path):
             os.remove(tmp_pcap_path)
-        # if 'pcap_output_dir' in locals() and os.path.exists(pcap_output_dir):
-        #     for f in os.listdir(pcap_output_dir):
-        #         os.remove(os.path.join(pcap_output_dir, f))
-        #     os.rmdir(pcap_output_dir)
 
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    # Ensure necessary directories exist
     if not os.path.exists('working'):
         os.makedirs('working')
         print("Created 'working/' directory. Please ensure models and scaler are in it.")
-    # The 'tools' directory for CICFlowMeter JAR is no longer needed if using pip cicflowmeter CLI
-    # but if you are still using the Java JAR version, ensure 'tools/' exists.
-    # if not os.path.exists('tools'):
-    #     os.makedirs('tools')
-    #     print("Created 'tools/' directory. Please place CICFlowMeter-5.1.jar inside it.")
 
     app.run()
