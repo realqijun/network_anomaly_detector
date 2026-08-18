@@ -188,3 +188,9 @@ anaconda_projects/
 datasets/
 .DS_Store
 working/
+
+# Large training inputs and generated model bundles
+data/
+artifacts/
+model_bundle/
+*.zip

@@ -46,3 +46,31 @@ The model was trained using the Intrusion detection evaluation dataset (CIC-IDS2
 1. Iman Sharafaldin, Arash Habibi Lashkari, and Ali A. Ghorbani, “Toward Generating a New Intrusion Detection Dataset and Intrusion Traffic Characterization”, 4th International Conference on Information Systems Security and Privacy (ICISSP), Portugal, January 2018.
 
 **If you have any enquiries, or suggestions, I would love it hear it! Kindly reach out to me**
+
+### Train on Google Colab
+
+Open [the Colab training notebook](notebooks/train_cse_cic_ids2018_colab.ipynb),
+select a GPU runtime, and run its cells in order. It uses KaggleHub to download the
+CSE-CIC-IDS2018 CSV mirror, holds out complete capture days, streams the dataset
+in bounded chunks, and downloads a versioned model-bundle ZIP when training is
+complete. The notebook can clone a pushed GitHub branch or accept direct uploads
+of `training_pipeline.py` and `detector_runtime.py` for unpushed local work.
+
+The reviewable source copy of the notebook's training implementation is
+[`training_pipeline.py`](training_pipeline.py). Deployment does not import that
+module. Local inference uses only the exported bundle and the small interface in
+[`detector.py`](detector.py):
+
+```python
+import pandas as pd
+
+from detector import run_detector
+
+flows = pd.read_csv("flows.csv")
+findings = run_detector(flows, "model_bundle")
+print(findings[["prediction", "confidence", "anomaly_score"]])
+```
+
+The input must contain the exact ordered feature contract recorded in the
+bundle's `manifest.json`. Missing or non-finite values are rejected instead of
+being silently replaced with zero.
