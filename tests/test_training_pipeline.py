@@ -3,11 +3,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
 from detector_runtime import Detector, HybridDetectorNetwork
-from training_pipeline import canonicalize_labels, partition_csv_files
+from training_pipeline import (
+    TrainingConfig,
+    _select_validation_indices,
+    canonicalize_labels,
+    partition_csv_files,
+)
 
 
 class LabelMappingTests(unittest.TestCase):
@@ -50,6 +56,35 @@ class LabelMappingTests(unittest.TestCase):
 
         self.assertEqual(training, [Path("day-20.csv"), Path("day-22.csv")])
         self.assertEqual(validation, [Path("day-21.csv")])
+
+    def test_default_validation_patterns_match_kaggle_filenames(self):
+        paths = [
+            Path("02-14-2018.csv"),
+            Path("02-16-2018.csv"),
+            Path("02-21-2018.csv"),
+            Path("02-23-2018.csv"),
+            Path("03-01-2018.csv"),
+        ]
+
+        training, validation = partition_csv_files(
+            paths, TrainingConfig(data_dir="unused").validation_patterns
+        )
+
+        self.assertEqual(training, [Path("02-14-2018.csv")])
+        self.assertEqual(validation, paths[1:])
+
+    def test_empty_validation_chunk_is_skipped(self):
+        remaining = {"Benign": 10, "DDoS": 10}
+
+        selected = _select_validation_indices(
+            labels=np.array(["unrecognized", "unrecognized"]),
+            classes=("Benign", "DDoS"),
+            remaining=remaining,
+            rng=np.random.default_rng(42),
+        )
+
+        self.assertEqual(selected.shape, (0,))
+        self.assertEqual(remaining, {"Benign": 10, "DDoS": 10})
 
 
 class DetectorRuntimeTests(unittest.TestCase):
