@@ -18,6 +18,7 @@ CICFLOWMETER_CMD = "cicflowmeter"
 # mapping for a production PCAP upload).
 CLI_TO_CONTRACT_FEATURE = {
     "dst_port": "Dst Port",
+    "protocol": "Protocol",
     "flow_duration": "Flow Duration",
     "tot_fwd_pkts": "Tot Fwd Pkts",
     "tot_bwd_pkts": "Tot Bwd Pkts",

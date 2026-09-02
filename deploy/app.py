@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 
@@ -14,9 +15,13 @@ from detector_runtime import Detector
 from pcap_parser import parse_pcap_to_dataframe
 
 DEFAULT_BUNDLE_DIR = "model_bundle"
+DEFAULT_ENABLE_PCAP_UPLOADS = False
 
 
-def create_app(bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR) -> Flask:
+def create_app(
+    bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR,
+    enable_pcap_uploads: bool | None = None,
+) -> Flask:
     """Build the Flask app around one immutable model bundle.
 
     If the bundle fails to load, the app still starts (so ops can see the
@@ -27,6 +32,12 @@ def create_app(bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR) -> Flask:
     app = Flask(__name__)
     app.config['SECRET_KEY'] = os.urandom(24).hex()
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+    if enable_pcap_uploads is None:
+        enable_pcap_uploads = (
+            os.environ.get('ENABLE_PCAP_UPLOADS', '').strip().lower() in {'1', 'true', 'yes'}
+            and shutil.which('docker') is not None
+        )
+    app.config['PCAP_UPLOADS_ENABLED'] = enable_pcap_uploads
 
     try:
         app.config['DETECTOR'] = Detector(bundle_dir)
@@ -38,7 +49,10 @@ def create_app(bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR) -> Flask:
     def index():
         if app.config['DETECTOR'] is None:
             flash("Detector not loaded. Check server logs for errors.", "danger")
-        return render_template('index.html')
+        return render_template(
+            'index.html',
+            pcap_uploads_enabled=app.config['PCAP_UPLOADS_ENABLED'],
+        )
 
     @app.route('/predict', methods=['POST'])
     def predict():
@@ -56,9 +70,18 @@ def create_app(bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR) -> Flask:
             flash('No selected file', 'warning')
             return redirect(url_for('index'))
 
+        allowed_extensions = {'csv'}
+        if app.config['PCAP_UPLOADS_ENABLED']:
+            allowed_extensions.update({'pcap', 'pcapng'})
         file_extension = file.filename.rsplit('.', 1)[-1].lower()
-        if file_extension not in ('csv', 'pcap', 'pcapng'):
-            flash("Unsupported file type. Please upload a CSV, PCAP, or PCAPNG file.", "warning")
+        if file_extension not in allowed_extensions:
+            if app.config['PCAP_UPLOADS_ENABLED']:
+                flash("Unsupported file type. Please upload a CSV, PCAP, or PCAPNG file.", "warning")
+            else:
+                flash(
+                    "Unsupported file type. This deployment accepts CSV uploads only unless PCAP uploads are explicitly enabled.",
+                    "warning",
+                )
             return redirect(url_for('index'))
 
         tmp_path = None

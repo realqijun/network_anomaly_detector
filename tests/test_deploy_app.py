@@ -89,6 +89,23 @@ class DeployAppPredictTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("missing required features", body)
 
+    def test_predict_rejects_pcap_uploads_when_the_runtime_has_not_enabled_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle, enable_pcap_uploads=False).test_client()
+
+            response = client.post(
+                "/predict",
+                data={"file": (io.BytesIO(b"pcap-bytes"), "capture.pcap")},
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+
+            body = response.get_data(as_text=True)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("CSV uploads only", body)
+
 
 class DeployAppFailClosedTests(unittest.TestCase):
     def test_create_app_serves_but_refuses_predict_when_bundle_is_missing(self):
@@ -125,7 +142,7 @@ class DeployAppFailClosedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             _write_bundle(bundle)
-            client = create_app(bundle).test_client()
+            client = create_app(bundle, enable_pcap_uploads=True).test_client()
 
             with patch(
                 "app.parse_pcap_to_dataframe",

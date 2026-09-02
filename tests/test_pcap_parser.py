@@ -16,6 +16,7 @@ class RenameCliColumnsToContractTests(unittest.TestCase):
         cli_flows = pd.DataFrame(
             {
                 "dst_port": [80],
+                "protocol": [6],
                 "flow_duration": [123.0],
                 "tot_fwd_pkts": [4.0],
             }
@@ -24,6 +25,7 @@ class RenameCliColumnsToContractTests(unittest.TestCase):
         renamed = rename_cli_columns_to_contract(cli_flows)
 
         self.assertEqual(renamed["Dst Port"].tolist(), [80])
+        self.assertEqual(renamed["Protocol"].tolist(), [6])
         self.assertEqual(renamed["Flow Duration"].tolist(), [123.0])
         self.assertEqual(renamed["Tot Fwd Pkts"].tolist(), [4.0])
 
