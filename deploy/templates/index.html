@@ -35,16 +35,28 @@
         {% endwith %}
 
         <form action="/predict" method="post" enctype="multipart/form-data">
-            <label for="file">Upload PCAP file for prediction:</label><br><br>
-            <input type="file" name="file" id="file" accept=".csv, .pcap, .pcapng"><br><br>
+            <label for="file">
+                {% if pcap_uploads_enabled %}
+                Upload CSV or PCAP file for prediction:
+                {% else %}
+                Upload CSV file for prediction:
+                {% endif %}
+            </label><br><br>
+            <input type="file" name="file" id="file" accept="{{ '.csv, .pcap, .pcapng' if pcap_uploads_enabled else '.csv' }}"><br><br>
             <input type="submit" value="Analyze Traffic">
         </form>
 
+        {% if pcap_uploads_enabled %}
         <p>
-            The PCAP file should contain network flow data with the same numerical features
-            as your training data. Non-feature columns (like 'Flow ID', 'Source IP', 'Label')
-            will be ignored.
+            CSV uploads must contain the exact bundle feature contract.
+            PCAP uploads additionally require Docker access plus the sibling `cfm` image for CICFlowMeter extraction.
         </p>
+        {% else %}
+        <p>
+            This deployment currently accepts CSV uploads only.
+            PCAP uploads stay disabled unless the runtime explicitly enables them and provides the CICFlowMeter Docker dependency.
+        </p>
+        {% endif %}
     </div>
 </body>
 </html>

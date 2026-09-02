@@ -7,15 +7,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY deploy/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY deploy/ ./
+COPY detector_runtime.py ./detector_runtime.py
+RUN test -f model_bundle/manifest.json && test -f model_bundle/model.pt
 
-RUN mkdir -p /app/working
-COPY working/anomaly_detector_model.pth /app/working/
-COPY working/min_max_scaler.pkl /app/working/
-COPY working/optimal_threshold.npy /app/working/
+ENV MODEL_BUNDLE_DIR=/app/model_bundle
 
 EXPOSE 8000
 

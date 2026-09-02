@@ -1,111 +1,158 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
 import os
 import sys
 import tempfile
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__))))
+from flask import Flask, flash, redirect, render_template, request, url_for
 
-from anomaly_detector_service import ConvAutoencoder, EXPECTED_FEATURES_CICFLOWMETER
-from pcap_parser import parse_pcap_to_dataframe
+_DEPLOY_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(_DEPLOY_DIR)
+sys.path.append(os.path.dirname(_DEPLOY_DIR))
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24).hex()
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+import pandas as pd
 
-detector = None
+from detector_runtime import Detector
+from pcap_parser import parse_pcap_to_dataframe, probe_pcap_runtime
 
-def load_detector():
-    global detector
-    if detector is None:
-        try:
-            detector = ConvAutoencoder(feature_columns=EXPECTED_FEATURES_CICFLOWMETER)
-            print("AnomalyDetector initialized successfully for Flask app.")
-        except Exception as e:
-            print(f"Error initializing AnomalyDetector: {e}. Please ensure 'working/' directory and models exist.")
-            detector = None # Ensure detector is None if init fails
+DEFAULT_BUNDLE_DIR = "model_bundle"
 
-load_detector()
 
-@app.route('/')
-def index():
-    if detector is None:
-        flash("Detector not loaded. Check server logs for errors.", "danger")
-    return render_template('index.html')
+def _resolve_bundle_dir(bundle_dir: str | os.PathLike) -> str:
+    bundle_path = os.fspath(bundle_dir)
+    if os.path.isabs(bundle_path):
+        return bundle_path
+    return os.path.join(_DEPLOY_DIR, bundle_path)
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if detector is None:
-        flash("Detector not available. Cannot perform prediction.", "danger")
-        return redirect(url_for('index'))
 
-    if 'file' not in request.files:
-        flash('No file part', 'warning')
-        return redirect(url_for('index'))
+def create_app(
+    bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR,
+    enable_pcap_uploads: bool | None = None,
+) -> Flask:
+    """Build the Flask app around one immutable model bundle.
 
-    file = request.files['file']
-    if file.filename == '':
-        flash('No selected file', 'warning')
-        return redirect(url_for('index'))
+    If the bundle fails to load, the app still starts (so ops can see the
+    error page and logs) but `/predict` refuses to score anything instead
+    of falling back to a degraded or legacy detector.
+    """
 
-    file_extension = file.filename.split('.')[-1].lower()
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = os.urandom(24).hex()
+    app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+    resolved_bundle_dir = _resolve_bundle_dir(bundle_dir)
+    app.config['MODEL_BUNDLE_DIR'] = resolved_bundle_dir
+    if enable_pcap_uploads is None:
+        requested = os.environ.get('ENABLE_PCAP_UPLOADS', '').strip().lower() in {'1', 'true', 'yes'}
+        if requested:
+            enable_pcap_uploads, reason = probe_pcap_runtime()
+            if not enable_pcap_uploads:
+                app.logger.warning("PCAP uploads were requested but disabled: %s", reason)
+        else:
+            enable_pcap_uploads = False
+    app.config['PCAP_UPLOADS_ENABLED'] = enable_pcap_uploads
 
-    if file_extension not in ['csv', 'pcap', 'pcapng']:
-        flash("Unsupported file type. Please upload a CSV, PCAP, or PCAPNG file.", "warning")
-        return redirect(url_for('index'))
-
-    tmp_pcap_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
-            file.save(tmp_file.name)
-            tmp_pcap_path = tmp_file.name
+        app.config['DETECTOR'] = Detector(resolved_bundle_dir)
+    except Exception as error:
+        app.logger.error("Failed to load model bundle from %s: %s", resolved_bundle_dir, error)
+        app.config['DETECTOR'] = None
 
-        pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output')
-        os.makedirs(pcap_output_dir, exist_ok=True)
-        df_to_predict = parse_pcap_to_dataframe(tmp_pcap_path, pcap_output_dir, EXPECTED_FEATURES_CICFLOWMETER)
+    @app.route('/')
+    def index():
+        if app.config['DETECTOR'] is None:
+            flash("Detector not loaded. Check server logs for errors.", "danger")
+        return render_template(
+            'index.html',
+            pcap_uploads_enabled=app.config['PCAP_UPLOADS_ENABLED'],
+        )
 
-        if df_to_predict.empty:
-            flash("PCAP file parsed, but no valid network flows were extracted.", "warning")
+    @app.route('/predict', methods=['POST'])
+    def predict():
+        detector = app.config['DETECTOR']
+        if detector is None:
+            flash("Detector not available. Cannot perform prediction.", "danger")
             return redirect(url_for('index'))
 
-        # Ensure all expected feature columns are present, fill missing ones with 0 if they were not in the parsed data
-        # This is important if the PCAP parser doesn't output all 78 features for some reason.
-        for col in EXPECTED_FEATURES_CICFLOWMETER:
-            if col not in df_to_predict.columns:
-                df_to_predict[col] = 0.0 # Fill missing columns with 0
+        if 'file' not in request.files:
+            flash('No file part', 'warning')
+            return redirect(url_for('index'))
 
-        # Call the predict method from your AnomalyDetector
-        predictions, anomaly_scores = detector.predict(df_to_predict)
+        file = request.files['file']
+        if file.filename == '':
+            flash('No selected file', 'warning')
+            return redirect(url_for('index'))
 
-        results = []
-        total_anomalies = 0
-        total_samples = len(predictions)
-        for i in range(total_samples):
-            if predictions[i] == 1: # 1 for anomaly
-                total_anomalies += 1
-            results.append({
-                'index': i + 1,
-                'prediction': 'Anomaly' if predictions[i] == 1 else 'Benign',
-                'score': f"{anomaly_scores[i]:.4f}"
-            })
-        anomaly_frequency = (total_anomalies / total_samples * 100) if total_samples > 0 else 0.0
-        flash(f"Processed {total_samples} samples. Found {total_anomalies} ({anomaly_frequency:.2f}%) anomalies", "success")
-        return render_template('results.html',
-                               results=results,
-                               total_samples=total_samples,
-                               total_anomalies=total_anomalies ,
-                               anomaly_frequency=f"{anomaly_frequency:.2f}")
-    except Exception as e:
-        flash(f"Error processing file: {e}", "danger")
-        return redirect(url_for('index'))
-    finally:
-        if tmp_pcap_path and os.path.exists(tmp_pcap_path):
-            os.remove(tmp_pcap_path)
+        allowed_extensions = {'csv'}
+        if app.config['PCAP_UPLOADS_ENABLED']:
+            allowed_extensions.update({'pcap', 'pcapng'})
+        file_extension = file.filename.rsplit('.', 1)[-1].lower()
+        if file_extension not in allowed_extensions:
+            if app.config['PCAP_UPLOADS_ENABLED']:
+                flash("Unsupported file type. Please upload a CSV, PCAP, or PCAPNG file.", "warning")
+            else:
+                flash(
+                    "Unsupported file type. This deployment accepts CSV uploads only unless PCAP uploads are explicitly enabled.",
+                    "warning",
+                )
+            return redirect(url_for('index'))
 
-    return redirect(url_for('index'))
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
+                file.save(tmp_file.name)
+                tmp_path = tmp_file.name
+
+            if file_extension == 'csv':
+                flows = pd.read_csv(tmp_path)
+            else:
+                flows = parse_pcap_to_dataframe(tmp_path, detector.feature_names)
+
+            if flows.empty:
+                flash("File parsed, but no valid network flows were extracted.", "warning")
+                return redirect(url_for('index'))
+
+            detections = detector.detect(flows)
+        except ValueError as error:
+            flash(f"Could not score uploaded file: {error}", "danger")
+            return redirect(url_for('index'))
+        except (FileNotFoundError, KeyError, RuntimeError) as error:
+            flash(f"Error processing file: {error}", "danger")
+            return redirect(url_for('index'))
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        results = [
+            {
+                'index': position + 1,
+                'prediction': row.prediction,
+                'confidence': (
+                    'n/a' if row.prediction == 'Unknown anomaly' else f"{row.confidence:.4f}"
+                ),
+                'anomaly_score': f"{row.anomaly_score:.4f}",
+                'is_anomaly': row.is_anomaly,
+            }
+            for position, row in enumerate(detections.itertuples())
+        ]
+        total_samples = len(results)
+        total_anomalies = sum(1 for row in results if row['is_anomaly'])
+        anomaly_frequency = (total_anomalies / total_samples * 100) if total_samples else 0.0
+        flash(
+            f"Processed {total_samples} samples. Found {total_anomalies} "
+            f"({anomaly_frequency:.2f}%) anomalies",
+            "success",
+        )
+        return render_template(
+            'results.html',
+            results=results,
+            total_samples=total_samples,
+            total_anomalies=total_anomalies,
+            anomaly_frequency=f"{anomaly_frequency:.2f}",
+        )
+
+    return app
+
+
+app = create_app(os.environ.get('MODEL_BUNDLE_DIR', DEFAULT_BUNDLE_DIR))
+
 
 if __name__ == '__main__':
-    if not os.path.exists('working'):
-        os.makedirs('working')
-        print("Created 'working/' directory. Please ensure models and scaler are in it.")
-
     app.run()
