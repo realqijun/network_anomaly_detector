@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -119,6 +120,28 @@ class DeployAppFailClosedTests(unittest.TestCase):
             body = response.get_data(as_text=True)
             self.assertEqual(response.status_code, 200)
             self.assertIn("Detector not available", body)
+
+    def test_pcap_upload_surfaces_processing_errors_instead_of_claiming_no_flows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            with patch(
+                "app.parse_pcap_to_dataframe",
+                side_effect=RuntimeError("PCAP processing requires Docker support"),
+            ):
+                response = client.post(
+                    "/predict",
+                    data={"file": (io.BytesIO(b"pcap-bytes"), "capture.pcap")},
+                    content_type="multipart/form-data",
+                    follow_redirects=True,
+                )
+
+            body = response.get_data(as_text=True)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("PCAP processing requires Docker support", body)
+            self.assertNotIn("no valid network flows were extracted", body.lower())
 
 
 if __name__ == "__main__":

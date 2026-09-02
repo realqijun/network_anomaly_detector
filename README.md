@@ -76,7 +76,11 @@ Missing or non-finite values are rejected instead of being silently replaced wit
 Point it at a trained bundle with the `MODEL_BUNDLE_DIR` environment variable.
 That variable defaults to `model_bundle` in the app's working directory.
 `deploy.sh <path-to-bundle>` copies a bundle into `deploy/model_bundle` for the Docker build.
+Build the image from the repo root so the container also includes `detector_runtime.py`:
+`docker build -f deploy/Dockerfile -t network-anomaly-detector .`
 If the configured bundle directory is missing or malformed, the app still starts but flashes an error and refuses every `/predict` request rather than falling back to a legacy detector.
 A CSV upload with missing or non-finite contract columns is rejected with the same error the local runtime raises, surfaced as a flash message instead of a 500 or a silently zero-filled prediction.
 PCAP uploads go through `deploy/pcap_parser.py`, which renames CICFlowMeter's CLI output columns to the bundle's contract names.
+That path requires a local Docker client plus a sibling `cfm` image and Docker socket access.
+If those dependencies are missing, the app now fails closed with an explicit processing error instead of pretending the upload contained no flows.
 That column mapping is derived from the published CSE-CIC-IDS2018 schema and has not yet been verified against a live `cicflowmeter` run, so prefer CSV uploads until that is confirmed against a real bundle.

@@ -80,7 +80,7 @@ def create_app(bundle_dir: "str | os.PathLike" = DEFAULT_BUNDLE_DIR) -> Flask:
         except ValueError as error:
             flash(f"Could not score uploaded file: {error}", "danger")
             return redirect(url_for('index'))
-        except (FileNotFoundError, KeyError) as error:
+        except (FileNotFoundError, KeyError, RuntimeError) as error:
             flash(f"Error processing file: {error}", "danger")
             return redirect(url_for('index'))
         finally:

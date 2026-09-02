@@ -1,12 +1,14 @@
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 
-from pcap_parser import rename_cli_columns_to_contract
+from pcap_parser import parse_pcap_to_dataframe, rename_cli_columns_to_contract
 
 
 class RenameCliColumnsToContractTests(unittest.TestCase):
@@ -31,6 +33,27 @@ class RenameCliColumnsToContractTests(unittest.TestCase):
         renamed = rename_cli_columns_to_contract(cli_flows)
 
         self.assertEqual(renamed.columns.tolist(), ["some_unmapped_column"])
+
+    def test_parse_pcap_raises_clear_runtime_error_when_docker_is_unavailable(self):
+        with patch("pcap_parser.shutil.copy"), patch(
+            "pcap_parser.subprocess.run",
+            side_effect=FileNotFoundError("docker"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires a local Docker client"):
+                parse_pcap_to_dataframe("capture.pcap", ["Flow Duration"])
+
+    def test_parse_pcap_surfaces_cicflowmeter_failures(self):
+        process_error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["docker", "run"],
+            stderr="cfm image missing",
+        )
+        with patch("pcap_parser.shutil.copy"), patch(
+            "pcap_parser.subprocess.run",
+            side_effect=process_error,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cfm image missing"):
+                parse_pcap_to_dataframe("capture.pcap", ["Flow Duration"])
 
 
 if __name__ == "__main__":

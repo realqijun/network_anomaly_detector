@@ -7,10 +7,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY deploy/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY deploy/ ./
+COPY detector_runtime.py ./detector_runtime.py
 
 ENV MODEL_BUNDLE_DIR=/app/model_bundle
 

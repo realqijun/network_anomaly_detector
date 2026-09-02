@@ -148,10 +148,16 @@ def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) ->
         df_flows = pd.read_csv(local_csv_path)
         df_flows.columns = df_flows.columns.str.strip()
         return rename_cli_columns_to_contract(df_flows)
-
-    except Exception as e:
-        print(f"Error during processing: {e}")
-        return pd.DataFrame(columns=list(expected_features))
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "PCAP processing requires a local Docker client and the sibling "
+            "'cfm' image; neither is available in this runtime"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("PCAP processing timed out while running CICFlowMeter") from error
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or str(error)).strip()
+        raise RuntimeError(f"PCAP processing failed while running CICFlowMeter: {details}") from error
     finally:
         for path in (host_pcap_path, local_csv_path):
             if os.path.exists(path):

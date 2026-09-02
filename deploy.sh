@@ -35,6 +35,7 @@ done
 
 if [ $COPY_SUCCESS -eq 0 ]; then
     echo "SUCCESS: Model bundle copied to ${DEPLOY_BUNDLE_DIR}."
+    echo "Next step: docker build -f deploy/Dockerfile -t network-anomaly-detector ."
     exit 0
 else
     echo "WARNING: Some bundle files could not be copied. Please check the logs above."
