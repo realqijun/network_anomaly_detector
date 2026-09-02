@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -112,6 +113,18 @@ class DeployAppPredictTests(unittest.TestCase):
             body = response.get_data(as_text=True)
             self.assertEqual(response.status_code, 200)
             self.assertIn("CSV uploads only", body)
+
+    def test_requested_pcap_uploads_stay_disabled_when_runtime_probe_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            with patch.dict(os.environ, {"ENABLE_PCAP_UPLOADS": "1"}, clear=False), patch(
+                "app.probe_pcap_runtime",
+                return_value=(False, "Docker daemon is unavailable"),
+            ):
+                app = create_app(bundle)
+
+        self.assertFalse(app.config["PCAP_UPLOADS_ENABLED"])
 
 
 class DeployAppFailClosedTests(unittest.TestCase):

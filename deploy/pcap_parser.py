@@ -2,11 +2,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Sequence
 
 import pandas as pd
 
 CICFLOWMETER_CMD = "cicflowmeter"
+DOCKER_IMAGE = "cfm"
 
 # CICFlowMeter's CLI output column names, mapped to the raw
 # CSE-CIC-IDS2018 CSV header names training_pipeline.py infers a bundle's
@@ -110,6 +112,40 @@ def rename_cli_columns_to_contract(flows: pd.DataFrame) -> pd.DataFrame:
     return flows.rename(columns=CLI_TO_CONTRACT_FEATURE)
 
 
+def probe_pcap_runtime() -> tuple[bool, str | None]:
+    docker_path = shutil.which("docker")
+    if docker_path is None:
+        return False, "Docker CLI is not installed"
+
+    try:
+        subprocess.run(
+            [docker_path, "info"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+        details = getattr(error, "stderr", None) or getattr(error, "stdout", None) or str(error)
+        return False, f"Docker daemon is unavailable: {details.strip()}"
+
+    try:
+        subprocess.run(
+            [docker_path, "image", "inspect", DOCKER_IMAGE],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or str(error)).strip()
+        return False, f"Required Docker image '{DOCKER_IMAGE}' is unavailable: {details}"
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return False, f"Could not verify required Docker image '{DOCKER_IMAGE}': {error}"
+
+    return True, None
+
+
 def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) -> pd.DataFrame:
     """Extract flow features from a PCAP via a sibling `cfm` CICFlowMeter container.
 
@@ -119,50 +155,50 @@ def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) ->
     path is not exercised by the test suite.
     """
 
-    host_base_dir = "/tmp/pcap_data"
-    host_upload_dir = os.path.join(host_base_dir, "uploads")
-    host_output_dir = os.path.join(host_base_dir, "outputs")
-    os.makedirs(host_upload_dir, exist_ok=True)
-    os.makedirs(host_output_dir, exist_ok=True)
+    ready, reason = probe_pcap_runtime()
+    if not ready:
+        raise RuntimeError(f"PCAP processing is unavailable: {reason}")
 
     pcap_filename = os.path.basename(pcap_path)
-    host_pcap_path = os.path.join(host_upload_dir, pcap_filename)
-    output_csv_name = f"{pcap_filename}.csv"
-    local_csv_path = os.path.join(host_output_dir, output_csv_name)
+    with tempfile.TemporaryDirectory(prefix="pcap-data-") as host_base_dir:
+        host_upload_dir = os.path.join(host_base_dir, "uploads")
+        host_output_dir = os.path.join(host_base_dir, "outputs")
+        os.makedirs(host_upload_dir, exist_ok=True)
+        os.makedirs(host_output_dir, exist_ok=True)
 
-    command = [
-        "docker", "run", "--rm",
-        "-v", f"{host_upload_dir}:/data/input",
-        "-v", f"{host_output_dir}:/data/output",
-        "cfm", CICFLOWMETER_CMD,
-        "-f", f"/data/input/{pcap_filename}",
-        "-c", f"/data/output/{output_csv_name}"
-    ]
+        host_pcap_path = os.path.join(host_upload_dir, pcap_filename)
+        output_csv_name = f"{pcap_filename}.csv"
+        local_csv_path = os.path.join(host_output_dir, output_csv_name)
+        command = [
+            "docker", "run", "--rm",
+            "-v", f"{host_upload_dir}:/data/input",
+            "-v", f"{host_output_dir}:/data/output",
+            DOCKER_IMAGE,
+            CICFLOWMETER_CMD,
+            "-f", f"/data/input/{pcap_filename}",
+            "-c", f"/data/output/{output_csv_name}",
+        ]
 
-    try:
-        shutil.copy(pcap_path, host_pcap_path)
-        subprocess.run(command, capture_output=True, text=True, check=True, timeout=300)
+        try:
+            shutil.copy(pcap_path, host_pcap_path)
+            subprocess.run(command, capture_output=True, text=True, check=True, timeout=300)
 
-        if not os.path.exists(local_csv_path) or os.path.getsize(local_csv_path) == 0:
-            return pd.DataFrame(columns=list(expected_features))
+            if not os.path.exists(local_csv_path) or os.path.getsize(local_csv_path) == 0:
+                return pd.DataFrame(columns=list(expected_features))
 
-        df_flows = pd.read_csv(local_csv_path)
-        df_flows.columns = df_flows.columns.str.strip()
-        return rename_cli_columns_to_contract(df_flows)
-    except FileNotFoundError as error:
-        raise RuntimeError(
-            "PCAP processing requires a local Docker client and the sibling "
-            "'cfm' image; neither is available in this runtime"
-        ) from error
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("PCAP processing timed out while running CICFlowMeter") from error
-    except subprocess.CalledProcessError as error:
-        details = (error.stderr or error.stdout or str(error)).strip()
-        raise RuntimeError(f"PCAP processing failed while running CICFlowMeter: {details}") from error
-    finally:
-        for path in (host_pcap_path, local_csv_path):
-            if os.path.exists(path):
-                os.remove(path)
+            df_flows = pd.read_csv(local_csv_path)
+            df_flows.columns = df_flows.columns.str.strip()
+            return rename_cli_columns_to_contract(df_flows)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "PCAP processing requires a local Docker client and the sibling "
+                f"'{DOCKER_IMAGE}' image; neither is available in this runtime"
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("PCAP processing timed out while running CICFlowMeter") from error
+        except subprocess.CalledProcessError as error:
+            details = (error.stderr or error.stdout or str(error)).strip()
+            raise RuntimeError(f"PCAP processing failed while running CICFlowMeter: {details}") from error
 
 
 if __name__ == '__main__':

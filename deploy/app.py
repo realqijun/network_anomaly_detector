@@ -1,5 +1,4 @@
 import os
-import shutil
 import sys
 import tempfile
 
@@ -12,7 +11,7 @@ sys.path.append(os.path.dirname(_DEPLOY_DIR))
 import pandas as pd
 
 from detector_runtime import Detector
-from pcap_parser import parse_pcap_to_dataframe
+from pcap_parser import parse_pcap_to_dataframe, probe_pcap_runtime
 
 DEFAULT_BUNDLE_DIR = "model_bundle"
 
@@ -41,10 +40,13 @@ def create_app(
     resolved_bundle_dir = _resolve_bundle_dir(bundle_dir)
     app.config['MODEL_BUNDLE_DIR'] = resolved_bundle_dir
     if enable_pcap_uploads is None:
-        enable_pcap_uploads = (
-            os.environ.get('ENABLE_PCAP_UPLOADS', '').strip().lower() in {'1', 'true', 'yes'}
-            and shutil.which('docker') is not None
-        )
+        requested = os.environ.get('ENABLE_PCAP_UPLOADS', '').strip().lower() in {'1', 'true', 'yes'}
+        if requested:
+            enable_pcap_uploads, reason = probe_pcap_runtime()
+            if not enable_pcap_uploads:
+                app.logger.warning("PCAP uploads were requested but disabled: %s", reason)
+        else:
+            enable_pcap_uploads = False
     app.config['PCAP_UPLOADS_ENABLED'] = enable_pcap_uploads
 
     try:

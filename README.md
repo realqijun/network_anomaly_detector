@@ -84,7 +84,8 @@ The Dockerfile now fails the build if `deploy/model_bundle/manifest.json` or `de
 If the configured bundle directory is missing or malformed, the app still starts but flashes an error and refuses every `/predict` request rather than falling back to a legacy detector.
 A CSV upload with missing or non-finite contract columns is rejected with the same error the local runtime raises, surfaced as a flash message instead of a 500 or a silently zero-filled prediction.
 PCAP uploads are disabled by default.
-They require both `ENABLE_PCAP_UPLOADS=1` and a runtime that provides the Docker CLI, a sibling `cfm` image, and Docker socket access for CICFlowMeter extraction.
-If those dependencies are missing, the app fails closed with an explicit processing error instead of pretending the upload contained no flows.
+They require both `ENABLE_PCAP_UPLOADS=1` and a startup runtime probe that confirms Docker daemon access plus the sibling `cfm` image.
+If those dependencies are missing, the app keeps PCAP uploads disabled instead of advertising a broken path.
+When PCAP uploads are enabled, each request uses its own temporary staging directory before invoking CICFlowMeter, so concurrent uploads do not race on shared `/tmp` filenames.
 The CICFlowMeter column rename now includes `protocol -> Protocol`, matching the current training contract's numeric feature discovery.
 The remaining column mapping is derived from the published CSE-CIC-IDS2018 schema and has not yet been verified against a live `cicflowmeter` run, so prefer CSV uploads until that is confirmed against a real bundle.
