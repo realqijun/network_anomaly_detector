@@ -15,7 +15,13 @@ from detector_runtime import Detector
 from pcap_parser import parse_pcap_to_dataframe
 
 DEFAULT_BUNDLE_DIR = "model_bundle"
-DEFAULT_ENABLE_PCAP_UPLOADS = False
+
+
+def _resolve_bundle_dir(bundle_dir: str | os.PathLike) -> str:
+    bundle_path = os.fspath(bundle_dir)
+    if os.path.isabs(bundle_path):
+        return bundle_path
+    return os.path.join(_DEPLOY_DIR, bundle_path)
 
 
 def create_app(
@@ -32,6 +38,8 @@ def create_app(
     app = Flask(__name__)
     app.config['SECRET_KEY'] = os.urandom(24).hex()
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+    resolved_bundle_dir = _resolve_bundle_dir(bundle_dir)
+    app.config['MODEL_BUNDLE_DIR'] = resolved_bundle_dir
     if enable_pcap_uploads is None:
         enable_pcap_uploads = (
             os.environ.get('ENABLE_PCAP_UPLOADS', '').strip().lower() in {'1', 'true', 'yes'}
@@ -40,9 +48,9 @@ def create_app(
     app.config['PCAP_UPLOADS_ENABLED'] = enable_pcap_uploads
 
     try:
-        app.config['DETECTOR'] = Detector(bundle_dir)
+        app.config['DETECTOR'] = Detector(resolved_bundle_dir)
     except Exception as error:
-        app.logger.error("Failed to load model bundle from %s: %s", bundle_dir, error)
+        app.logger.error("Failed to load model bundle from %s: %s", resolved_bundle_dir, error)
         app.config['DETECTOR'] = None
 
     @app.route('/')
@@ -114,7 +122,9 @@ def create_app(
             {
                 'index': position + 1,
                 'prediction': row.prediction,
-                'confidence': f"{row.confidence:.4f}",
+                'confidence': (
+                    'n/a' if row.prediction == 'Unknown anomaly' else f"{row.confidence:.4f}"
+                ),
                 'anomaly_score': f"{row.anomaly_score:.4f}",
                 'is_anomaly': row.is_anomaly,
             }

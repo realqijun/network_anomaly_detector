@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 
-from app import create_app
+from app import _resolve_bundle_dir, create_app
 from detector_runtime import HybridDetectorNetwork
 
 
@@ -62,6 +62,12 @@ def _post_csv(client, csv_bytes: bytes):
 
 
 class DeployAppPredictTests(unittest.TestCase):
+    def test_relative_bundle_paths_resolve_under_deploy_directory(self):
+        resolved = Path(_resolve_bundle_dir("model_bundle"))
+
+        self.assertEqual(resolved.name, "model_bundle")
+        self.assertEqual(resolved.parent.name, "deploy")
+
     def test_predict_scores_uploaded_csv_through_the_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
@@ -76,6 +82,7 @@ class DeployAppPredictTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("Benign", body)
             self.assertIn("Unknown anomaly", body)
+            self.assertIn("n/a", body)
 
     def test_predict_flashes_error_for_missing_contract_columns(self):
         with tempfile.TemporaryDirectory() as temporary:
