@@ -16,8 +16,6 @@
         th { background-color: #f0f4f7; color: #555; font-weight: 600; text-transform: uppercase; font-size: 0.9em; }
         .anomaly { background-color: #ffe6e6 !important; }
         .benign { background-color: #e6ffe6 !important; }
-        .anomaly-score-note { font-size: 0.85em; color: #e74c3c; margin-top: 10px; text-align: center; padding: 10px; background-color: #FCF0F0; border-left: 5px solid #e74c3c; border-radius: 4px; }
-        .anomaly-score-note strong { font-weight: 700; }
         .flash { padding: 12px 20px; margin: 10px auto; border-radius: 8px; font-weight: 500; font-size: 0.95em; max-width: 90%; display: inline-block; }
         .flash.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .flash.danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
@@ -58,28 +56,22 @@
             </div>
         </div>
 
-        {% if total_anomalies > 0 and results and results[0].score|float > 1000 %}
-        <p class="anomaly-score-note">
-            <strong>Note on Anomaly Scores:</strong> The detected anomaly scores appear unusually large.
-            This may indicate an issue with feature scaling or the model's output in the backend.
-        </p>
-        {% endif %}
-
-
         <table>
             <thead>
                 <tr>
                     <th>Sample #</th>
                     <th>Prediction</th>
-                    <th>Anomaly Score (MSE)</th>
+                    <th>Confidence</th>
+                    <th>Anomaly Score</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in results %}
-                    <tr class="{{ 'anomaly' if row.prediction == 'Anomaly' else 'benign' }}">
+                    <tr class="{{ 'anomaly' if row.is_anomaly else 'benign' }}">
                         <td>{{ row.index }}</td>
                         <td>{{ row.prediction }}</td>
-                        <td>{{ row.score }}</td>
+                        <td>{{ row.confidence }}</td>
+                        <td>{{ row.anomaly_score }}</td>
                     </tr>
                 {% endfor %}
             </tbody>
