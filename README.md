@@ -38,7 +38,8 @@ Later I found out that the rate of false positives was too high without further 
 
 ---
 
-The model was trained using the Intrusion detection evaluation dataset (CIC-IDS2017).
+The current training pipeline uses the CSE-CIC-IDS2018 intrusion detection evaluation dataset.
+The original autoencoder in `legacy/` was trained on CIC-IDS2017.
 
 ### References
 
