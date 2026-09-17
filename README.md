@@ -89,3 +89,31 @@ If those dependencies are missing, the app keeps PCAP uploads disabled instead o
 When PCAP uploads are enabled, each request uses its own temporary staging directory before invoking CICFlowMeter, so concurrent uploads do not race on shared `/tmp` filenames.
 The CICFlowMeter column rename now includes `protocol -> Protocol`, matching the current training contract's numeric feature discovery.
 The remaining column mapping is derived from the published CSE-CIC-IDS2018 schema and has not yet been verified against a live `cicflowmeter` run, so prefer CSV uploads until that is confirmed against a real bundle.
+
+### Running the checks
+
+Create an environment and install the development dependencies.
+The CPU-only torch wheel is installed first because the PyTorch index does not serve the other packages.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-dev.txt
+```
+
+Run the same two commands CI runs:
+
+```sh
+python -m compileall -q . -x '(legacy|\.git|\.venv|\.agents|\.claude)'
+python -m unittest discover -s tests -t . -v
+```
+
+Run a single module while working on it, for example:
+
+```sh
+python -m unittest tests.test_deploy_app -v
+```
+
+`.github/workflows/ci.yml` runs these on every push and pull request, so a
+contract or bundle regression fails CI rather than reaching a deployment.
