@@ -13,44 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 
 from app import _resolve_bundle_dir, create_app
 from detector_runtime import HybridDetectorNetwork
+from tests.bundle_fixture import write_bundle as _write_bundle
 
-
-def _write_bundle(directory: Path) -> None:
-    model = HybridDetectorNetwork(
-        input_dim=2,
-        num_classes=2,
-        hidden_dims=(4,),
-        latent_dim=2,
-        dropout=0.0,
-    )
-    for parameter in model.parameters():
-        parameter.data.zero_()
-    torch.save(model.state_dict(), directory / "model.pt")
-    manifest = {
-        "bundle_format_version": 1,
-        "feature_contract": {
-            "features": ["Flow Duration", "Tot Fwd Pkts"],
-            "transform": "signed_log1p_standardize",
-            "mean": [0.0, 0.0],
-            "scale": [1.0, 1.0],
-            "missing_value_policy": "reject",
-        },
-        "taxonomy": {
-            "classes": ["Benign", "DDoS"],
-            "reportable": {"Benign": True, "DDoS": True},
-            "unknown_label": "Unknown anomaly",
-        },
-        "model": {
-            "hidden_dims": [4],
-            "latent_dim": 2,
-            "dropout": 0.0,
-        },
-        "thresholds": {
-            "anomaly": 0.1,
-            "class_confidence": {"Benign": 0.0, "DDoS": 0.9},
-        },
-    }
-    (directory / "manifest.json").write_text(json.dumps(manifest))
+# A capture the window block can actually be computed from: two sources onto
+# one destination inside one second. Identity columns are not contract feature
+# names, so a CSV without them would never exercise the window path.
+WINDOW_CSV = (
+    b"Flow Duration,Tot Fwd Pkts,Timestamp,Src IP,Dst IP,Src Port,Dst Port,"
+    b"Protocol,SYN Flag Cnt,ACK Flag Cnt,TotLen Fwd Pkts,TotLen Bwd Pkts,Tot Bwd Pkts\n"
+    b"0.0,0.0,2018-02-14 08:00:00,10.0.0.1,10.0.0.9,1111,80,6,1,0,100,0,0\n"
+    b"9.0,9.0,2018-02-14 08:00:00,10.0.0.2,10.0.0.9,2222,80,6,1,0,100,0,0\n"
+)
 
 
 def _post_csv(client, csv_bytes: bytes):
@@ -84,6 +57,72 @@ class DeployAppPredictTests(unittest.TestCase):
             self.assertIn("Benign", body)
             self.assertIn("Unknown anomaly", body)
             self.assertIn("n/a", body)
+
+    def test_a_flagged_row_carries_its_contributing_features_to_the_page(self):
+        """The end-to-end path: bundle load, score, attribute, render."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(
+                client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n9.0,9.0\n"
+            )
+
+            body = response.get_data(as_text=True)
+            self.assertIn("Top contributing features", body)
+            self.assertIn("Flow Duration", body)
+            self.assertIn("standard", body)
+
+    def test_scores_a_window_bundle_end_to_end_from_identity_columns(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle, with_window_block=True)
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(client, WINDOW_CSV)
+
+            body = response.get_data(as_text=True)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Flows scored", body)
+            self.assertNotIn("missing required features", body)
+
+    def test_a_window_bundle_refuses_a_csv_without_identity_columns(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle, with_window_block=True)
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(
+                client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n2.0,2.0\n"
+            )
+
+            self.assertIn("Dst IP", response.get_data(as_text=True))
+
+    def test_reports_missing_window_coverage_rather_than_hiding_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle, disabled_reason="capture files carry no addresses")
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(
+                client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n2.0,2.0\n"
+            )
+
+            body = response.get_data(as_text=True)
+            self.assertIn("Coverage gaps", body)
+            self.assertIn("capture files carry no addresses", body)
+
+    def test_warns_when_a_capture_is_too_short_for_the_widest_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle, with_window_block=True)
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(client, WINDOW_CSV)
+
+            self.assertIn("Coverage gaps", response.get_data(as_text=True))
 
     def test_predict_flashes_error_for_missing_contract_columns(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -128,6 +167,19 @@ class DeployAppPredictTests(unittest.TestCase):
 
 
 class DeployAppFailClosedTests(unittest.TestCase):
+    def test_an_outdated_bundle_says_so_instead_of_looking_like_a_missing_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            manifest["bundle_format_version"] = 1
+            (bundle / "manifest.json").write_text(json.dumps(manifest))
+
+            client = create_app(bundle).test_client()
+            response = client.get("/", follow_redirects=True)
+
+            self.assertIn("not compatible with this runtime", response.get_data(as_text=True))
+
     def test_create_app_serves_but_refuses_predict_when_bundle_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             missing_bundle = Path(temporary) / "does-not-exist"
@@ -147,7 +199,7 @@ class DeployAppFailClosedTests(unittest.TestCase):
             # so torch's load_state_dict raises RuntimeError, not one of the
             # exception types Detector's own validation raises deliberately.
             mismatched = HybridDetectorNetwork(
-                input_dim=5, num_classes=2, hidden_dims=(4,), latent_dim=2, dropout=0.0
+                input_dim=7, num_classes=2, hidden_dims=(4,), latent_dim=2, dropout=0.0
             )
             torch.save(mismatched.state_dict(), bundle / "model.pt")
 

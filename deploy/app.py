@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(_DEPLOY_DIR))
 import pandas as pd
 
 from detector_runtime import Detector
+from feature_contract import ContractMismatchError, window_coverage_warning
 from pcap_parser import parse_pcap_to_dataframe, probe_pcap_runtime
 
 DEFAULT_BUNDLE_DIR = "model_bundle"
@@ -51,14 +52,32 @@ def create_app(
 
     try:
         app.config['DETECTOR'] = Detector(resolved_bundle_dir)
+        app.config['BUNDLE_ERROR'] = None
+    except ContractMismatchError as error:
+        # Worth its own message: this bundle is not broken, it is out of date,
+        # and the fix is to retrain rather than to check the file paths.
+        app.logger.error(
+            "Model bundle at %s declares an incompatible contract: %s",
+            resolved_bundle_dir,
+            error,
+        )
+        app.config['DETECTOR'] = None
+        app.config['BUNDLE_ERROR'] = (
+            f"The configured model bundle is not compatible with this runtime. {error}"
+        )
     except Exception as error:
         app.logger.error("Failed to load model bundle from %s: %s", resolved_bundle_dir, error)
         app.config['DETECTOR'] = None
+        app.config['BUNDLE_ERROR'] = None
 
     @app.route('/')
     def index():
         if app.config['DETECTOR'] is None:
-            flash("Detector not loaded. Check server logs for errors.", "danger")
+            flash(
+                app.config.get('BUNDLE_ERROR')
+                or "Detector not loaded. Check server logs for errors.",
+                "danger",
+            )
         return render_template(
             'index.html',
             pcap_uploads_enabled=app.config['PCAP_UPLOADS_ENABLED'],
@@ -95,6 +114,7 @@ def create_app(
             return redirect(url_for('index'))
 
         tmp_path = None
+        coverage_notes: list[str] = []
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
                 file.save(tmp_file.name)
@@ -109,7 +129,24 @@ def create_app(
                 flash("File parsed, but no valid network flows were extracted.", "warning")
                 return redirect(url_for('index'))
 
-            detections = detector.detect(flows)
+            # Coverage is part of the answer, not a footnote. A bundle with no
+            # window block cannot see rate-driven behaviour, and a capture too
+            # short for the widest window produces window values that look
+            # confident and mean nothing.
+            if not detector.has_window_coverage:
+                reason = detector.window_coverage_reason
+                coverage_notes.append(
+                    "This model was trained without temporal window features, so "
+                    "rate-driven behaviour such as DDoS, scanning and brute force "
+                    "is outside its coverage."
+                    + (f" Reason recorded at training time: {reason}" if reason else "")
+                )
+            else:
+                span_note = window_coverage_warning(flows)
+                if span_note:
+                    coverage_notes.append(span_note)
+
+            detections = detector.detect(flows, explain=True)
         except ValueError as error:
             flash(f"Could not score uploaded file: {error}", "danger")
             return redirect(url_for('index'))
@@ -129,6 +166,7 @@ def create_app(
                 ),
                 'anomaly_score': f"{row.anomaly_score:.4f}",
                 'is_anomaly': row.is_anomaly,
+                'explanation': getattr(row, 'explanation', []) or [],
             }
             for position, row in enumerate(detections.itertuples())
         ]
@@ -146,6 +184,7 @@ def create_app(
             total_samples=total_samples,
             total_anomalies=total_anomalies,
             anomaly_frequency=f"{anomaly_frequency:.2f}",
+            coverage_notes=coverage_notes,
         )
 
     return app

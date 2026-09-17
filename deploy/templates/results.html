@@ -1,85 +1,100 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" type="image/png" href="{{ url_for('static', filename='assets/icon.png') }}"/>
-    <title>Anomaly Detection Results</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Detection results</title>
     <style>
-        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 20px; background-color: #eef2f7; color: #34495e; line-height: 1.6; }
-        .container { max-width: 1200px; margin: 40px auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0,0,0,0.1); }
-        h1 { color: #0056b3; text-align: center; }
-        .flashes { list-style: none; padding: 0; margin-bottom: 25px; text-align: center; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #e0e0e0; padding: 12px 15px; text-align: left; }
-        th { background-color: #f0f4f7; color: #555; font-weight: 600; text-transform: uppercase; font-size: 0.9em; }
-        .anomaly { background-color: #ffe6e6 !important; }
-        .benign { background-color: #e6ffe6 !important; }
-        .flash { padding: 12px 20px; margin: 10px auto; border-radius: 8px; font-weight: 500; font-size: 0.95em; max-width: 90%; display: inline-block; }
-        .flash.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .flash.danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .flash.warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-        .summary-box { background-color: #f7f9fc;  border: 1px solid #e1e7f0; border-radius: 8px; padding: 20px 25px; margin-bottom: 30px; display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 15px; }
-        .summary-item { text-align: center; padding: 10px; flex-grow: 1; min-width: 150px; }
-        .summary-item strong { display: block; font-size: 1.8em; color: #3498db; margin-bottom: 5px; }
-        .summary-item span { font-size: 0.9em; color: #666; }
-        .summary-item.anomalies strong { color: #e74c3c; }
+        :root { color-scheme: light dark; --line: #d6d9de; --muted: #5b6270; --warn-bg: #fff4d6; --warn-line: #e0b451; }
+        @media (prefers-color-scheme: dark) {
+            :root { --line: #333a45; --muted: #99a1b0; --warn-bg: #3a3116; --warn-line: #7d6528; }
+        }
+        body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px 16px; line-height: 1.5; }
+        main { max-width: 900px; margin: 0 auto; }
+        h1 { font-size: 1.5rem; margin: 0 0 16px; }
+        .summary { display: flex; flex-wrap: wrap; gap: 20px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 20px; }
+        .summary div { min-width: 120px; }
+        .summary dt { font-size: .8rem; color: var(--muted); margin: 0 0 2px; }
+        .summary dd { margin: 0; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+        .coverage { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; }
+        .coverage h2 { font-size: .95rem; margin: 0 0 6px; }
+        .coverage p { margin: 0 0 6px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+        th { font-size: .8rem; color: var(--muted); font-weight: 600; }
+        td.num { font-variant-numeric: tabular-nums; }
+        details summary { cursor: pointer; font-size: .85rem; color: var(--muted); }
+        .why { margin: 8px 0 0; padding-left: 18px; font-size: .85rem; }
+        .why li { margin-bottom: 3px; }
+        .note { font-size: .8rem; color: var(--muted); margin-top: 20px; }
+        a { color: inherit; }
+        @media (max-width: 640px) { th:nth-child(3), td:nth-child(3) { display: none; } }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Anomaly Detection Results</h1>
+<main>
+    <h1>Detection results</h1>
 
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                <ul class="flashes">
-                {% for category, message in messages %}
-                    <li class="flash {{ category }}">{{ message }}</li>
-                {% endfor %}
-                </ul>
-            {% endif %}
-        {% endwith %}
+    <dl class="summary">
+        <div><dt>Flows scored</dt><dd>{{ total_samples }}</dd></div>
+        <div><dt>Flagged</dt><dd>{{ total_anomalies }}</dd></div>
+        <div><dt>Flagged share</dt><dd>{{ anomaly_frequency }}%</dd></div>
+    </dl>
 
-        <div class="summary-box">
-            <div class="summary-item">
-                <strong>{{ total_samples }}</strong>
-                <span>Total Samples Analyzed</span>
-            </div>
-            <div class="summary-item anomalies">
-                <strong>{{ total_anomalies }}</strong>
-                <span>Anomalies Detected</span>
-            </div>
-            <div class="summary-item">
-                <strong>{{ anomaly_frequency }}%</strong>
-                <span>Anomaly Percentage</span>
-            </div>
-        </div>
+    {% if coverage_notes %}
+    <section class="coverage">
+        <h2>Coverage gaps</h2>
+        {% for note in coverage_notes %}<p>{{ note }}</p>{% endfor %}
+    </section>
+    {% endif %}
 
-        <table>
-            <thead>
-                <tr>
-                    <th>Sample #</th>
-                    <th>Prediction</th>
-                    <th>Confidence</th>
-                    <th>Anomaly Score</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for row in results %}
-                    <tr class="{{ 'anomaly' if row.is_anomaly else 'benign' }}">
-                        <td>{{ row.index }}</td>
-                        <td>{{ row.prediction }}</td>
-                        <td>{{ row.confidence }}</td>
-                        <td>{{ row.anomaly_score }}</td>
-                    </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+    <table>
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Prediction</th>
+                <th>Confidence</th>
+                <th>Anomaly score</th>
+                <th>Why</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in results %}
+            <tr>
+                <td class="num">{{ row.index }}</td>
+                <td>{{ row.prediction }}</td>
+                <td class="num">{{ row.confidence }}</td>
+                <td class="num">{{ row.anomaly_score }}</td>
+                <td>
+                    {% if row.explanation %}
+                    <details>
+                        <summary>Top contributing features</summary>
+                        <ul class="why">
+                        {% for item in row.explanation %}
+                            <li>
+                                <strong>{{ item.feature }}</strong>
+                                observed {{ "%.2f"|format(item.observed_z) }} standard
+                                deviations
+                                {{ "above" if item.direction >= 0 else "below" }}
+                                the training baseline
+                            </li>
+                        {% endfor %}
+                        </ul>
+                    </details>
+                    {% else %}
+                    <span class="note">-</span>
+                    {% endif %}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
 
-        <div class="button-group">
-            <a href="{{ url_for('index') }}" class="action-button">Analyze another file</a>
-        </div>
-    </div>
+    <p class="note">
+        Feature attributions support analyst interpretation. They indicate which
+        measurements moved a score, not that an attack occurred.
+        <a href="{{ url_for('index') }}">Score another capture</a>.
+    </p>
+</main>
 </body>
 </html>

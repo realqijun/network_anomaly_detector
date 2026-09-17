@@ -38,6 +38,15 @@ class RenameCliColumnsToContractTests(unittest.TestCase):
 
         self.assertEqual(renamed.columns.tolist(), ["some_unmapped_column"])
 
+    def test_renames_the_identity_columns_window_features_need(self):
+        cli_flows = pd.DataFrame(
+            {"src_ip": ["10.0.0.1"], "dst_ip": ["10.0.0.2"], "timestamp": ["t"]}
+        )
+
+        renamed = rename_cli_columns_to_contract(cli_flows)
+
+        self.assertEqual(renamed.columns.tolist(), ["Src IP", "Dst IP", "Timestamp"])
+
     def test_probe_pcap_runtime_reports_missing_docker_cli(self):
         with patch("pcap_parser.shutil.which", return_value=None):
             ready, reason = probe_pcap_runtime()

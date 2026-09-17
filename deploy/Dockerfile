@@ -12,6 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY deploy/ ./
 COPY detector_runtime.py ./detector_runtime.py
+# The runtime imports these, so the image breaks on start without them.
+COPY feature_contract.py ./feature_contract.py
+COPY explain.py ./explain.py
 RUN test -f model_bundle/manifest.json && test -f model_bundle/model.pt
 
 ENV MODEL_BUNDLE_DIR=/app/model_bundle
