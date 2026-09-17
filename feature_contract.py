@@ -7,11 +7,18 @@ feature is called, what units it carries, and how it is scaled.
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # Manifest layout version. Bump when the shape of manifest.json changes.
@@ -47,6 +54,30 @@ WINDOW_SOURCE_COLUMNS = (
     "Tot Bwd Pkts",
     "SYN Flag Cnt",
     "ACK Flag Cnt",
+)
+
+# Observation windows, in seconds. Buckets are floor(epoch_seconds / W), so an
+# offline replay and a live feed bucket identically with no capture start time.
+WINDOW_SECONDS = (1, 10, 60)
+
+_WINDOW_FIELDS = (
+    "dst_flow_count",
+    "dst_unique_src",
+    "dst_unique_port",
+    "src_flow_count",
+    "src_unique_dst",
+    "pair_flow_count",
+    "service_flow_count",
+    "dst_bytes_rate",
+    "dst_pkt_rate",
+    "syn_ack_imbalance",
+    "dst_flow_count_delta",
+)
+
+WINDOW_FEATURE_NAMES: tuple[str, ...] = tuple(
+    f"win{seconds}s_{field_name}"
+    for seconds in WINDOW_SECONDS
+    for field_name in _WINDOW_FIELDS
 )
 
 
@@ -212,7 +243,7 @@ _TIMESTAMP_FORMATS = (
 )
 
 
-def parse_timestamps(values: pd.Series) -> pd.Series:
+def parse_timestamps(values: pd.Series, strict: bool = True) -> pd.Series:
     """Parse capture timestamps with an explicit format, never by guessing.
 
     These CSVs carry a local-time string with no zone, and pandas will happily
@@ -220,6 +251,14 @@ def parse_timestamps(values: pd.Series) -> pd.Series:
     it. Either choice silently reorders every window bucket, so this function
     accepts a format only if it parses every value, and refuses when two
     formats both parse and disagree.
+
+    `strict=False` is used only by the sidecar and profile passes, which read a
+    whole file to produce a row-aligned result. Those files carry repeated
+    header rows, whose Timestamp is the literal string "Timestamp". Dropping
+    such rows would make the output shorter than the file, and because the
+    sidecar is joined by row position every later row would silently receive
+    another row's window values. So non-strict mode yields NaT for them and
+    keeps the length, letting the caller's own non-finite filter remove them.
     """
 
     text = values.astype("string").str.strip()
@@ -227,10 +266,12 @@ def parse_timestamps(values: pd.Series) -> pd.Series:
     if not present.any():
         raise ValueError("Timestamp column contains no parseable values")
 
+    threshold = 1.0 if strict else 0.5
     candidates: dict[str, pd.Series] = {}
     for fmt in _TIMESTAMP_FORMATS:
         parsed = pd.to_datetime(text, format=fmt, errors="coerce")
-        if parsed[present].notna().all():
+        share = float(parsed[present].notna().mean())
+        if share >= threshold:
             candidates[fmt] = parsed
 
     if not candidates:
@@ -239,12 +280,17 @@ def parse_timestamps(values: pd.Series) -> pd.Series:
             f"Could not parse Timestamp with any known format; first value is {sample!r}"
         )
 
-    resolved = list(candidates.items())
+    resolved = sorted(
+        candidates.items(), key=lambda item: float(item[1].notna().mean()), reverse=True
+    )
     reference_format, reference = resolved[0]
     for other_format, other in resolved[1:]:
-        if not reference[present].equals(other[present]):
-            disagreement = text[present][
-                reference[present].ne(other[present])
+        comparable = present & reference.notna() & other.notna()
+        if not comparable.any():
+            continue
+        if not reference[comparable].equals(other[comparable]):
+            disagreement = text[comparable][
+                reference[comparable].ne(other[comparable])
             ].iloc[0]
             raise ValueError(
                 "Timestamp day/month order is ambiguous: "
@@ -253,6 +299,244 @@ def parse_timestamps(values: pd.Series) -> pd.Series:
                 "to ISO 8601 before training or scoring."
             )
     return reference
+
+
+def canonical_name(column: str) -> str:
+    """The contract name a raw header maps to."""
+
+    bare = str(column).strip()
+    return COLUMN_ALIASES.get(bare, bare)
+
+
+WINDOW_INPUT_COLUMNS: tuple[str, ...] = IDENTITY_COLUMNS + WINDOW_SOURCE_COLUMNS
+
+
+def window_inputs_available(flows: pd.DataFrame) -> tuple[bool, list[str]]:
+    """Report whether a frame can support the window block, and what is missing."""
+
+    present = {canonical_name(column) for column in flows.columns}
+    missing = [column for column in WINDOW_INPUT_COLUMNS if column not in present]
+    return not missing, missing
+
+
+def window_coverage_warning(flows: pd.DataFrame) -> str | None:
+    """Warn when a frame is too small for its window features to mean anything.
+
+    A handful of hand-picked flows produce near-1 counts for every window
+    field, which is far outside the training distribution, and the model would
+    otherwise score them confidently with nothing indicating the problem.
+    """
+
+    available, _ = window_inputs_available(flows)
+    if not available or flows.empty:
+        return None
+
+    widest = max(WINDOW_SECONDS)
+    normalized = normalize_columns(flows)
+    seconds = epoch_seconds(parse_timestamps(normalized["Timestamp"], strict=False))
+    finite = seconds.dropna()
+    if finite.empty:
+        return None
+
+    span = float(finite.max() - finite.min())
+    if span < widest:
+        return (
+            f"This capture spans {span:.1f}s, shorter than the widest observation "
+            f"window of {widest}s, so window features describe a partial window "
+            "and scores from them are unreliable."
+        )
+    return None
+
+
+def _window_block(frame: pd.DataFrame, seconds: int) -> pd.DataFrame:
+    """Compute one window's eleven fields over a complete, time-valid frame."""
+
+    bucket = np.floor(frame["_epoch"] / seconds).astype("int64")
+    work = frame.assign(_bucket=bucket)
+
+    by_dst = work.groupby(["_bucket", "Dst IP"], sort=False)
+    by_src = work.groupby(["_bucket", "Src IP"], sort=False)
+    by_pair = work.groupby(["_bucket", "Src IP", "Dst IP"], sort=False)
+    by_service = work.groupby(["_bucket", "Dst IP", "Dst Port"], sort=False)
+
+    syn = by_dst["SYN Flag Cnt"].transform("sum")
+    ack = by_dst["ACK Flag Cnt"].transform("sum")
+
+    block = pd.DataFrame(index=frame.index)
+    block[f"win{seconds}s_dst_flow_count"] = by_dst["Dst IP"].transform("size")
+    block[f"win{seconds}s_dst_unique_src"] = by_dst["Src IP"].transform("nunique")
+    block[f"win{seconds}s_dst_unique_port"] = by_dst["Dst Port"].transform("nunique")
+    block[f"win{seconds}s_src_flow_count"] = by_src["Src IP"].transform("size")
+    block[f"win{seconds}s_src_unique_dst"] = by_src["Dst IP"].transform("nunique")
+    block[f"win{seconds}s_pair_flow_count"] = by_pair["Dst IP"].transform("size")
+    block[f"win{seconds}s_service_flow_count"] = by_service["Dst IP"].transform("size")
+    block[f"win{seconds}s_dst_bytes_rate"] = (
+        by_dst["_bytes"].transform("sum") / seconds
+    )
+    block[f"win{seconds}s_dst_pkt_rate"] = by_dst["_packets"].transform("sum") / seconds
+    block[f"win{seconds}s_syn_ack_imbalance"] = (syn - ack) / (syn + ack + 1.0)
+
+    # Baseline delta against the immediately preceding bucket for the same
+    # destination. An absent predecessor counts as zero, so a destination's
+    # first observed bucket reports its own load as the change.
+    counts = (
+        work.groupby(["Dst IP", "_bucket"], sort=False)
+        .size()
+        .rename("_count")
+        .reset_index()
+    )
+    previous = counts.rename(columns={"_count": "_previous"})
+    previous["_bucket"] = previous["_bucket"] + 1
+    joined = counts.merge(previous, on=["Dst IP", "_bucket"], how="left")
+    joined["_delta"] = joined["_count"] - joined["_previous"].fillna(0.0)
+    lookup = work[["Dst IP", "_bucket"]].merge(
+        joined[["Dst IP", "_bucket", "_delta"]], on=["Dst IP", "_bucket"], how="left"
+    )
+    block[f"win{seconds}s_dst_flow_count_delta"] = lookup["_delta"].to_numpy()
+
+    return block.astype(np.float32)
+
+
+def compute_window_features(flows: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
+    """Compute the window block over one complete frame.
+
+    This is the only implementation, called by training and inference alike.
+    Aggregates are scoped to the frame handed in, so the caller is responsible
+    for handing in a complete capture rather than an arbitrary slice of one.
+
+    The result always has one row per input row. Rows whose timestamp could not
+    be parsed carry NaN window values rather than being dropped, so a caller
+    joining by row position stays aligned.
+    """
+
+    normalized = normalize_columns(flows)
+    available, missing = window_inputs_available(normalized)
+    if not available:
+        raise ValueError(
+            "Cannot compute window features; frame is missing: " + ", ".join(missing)
+        )
+
+    seconds = epoch_seconds(parse_timestamps(normalized["Timestamp"], strict=strict))
+    work = pd.DataFrame(
+        {
+            "_epoch": seconds.to_numpy(),
+            "Src IP": normalized["Src IP"].astype("string"),
+            "Dst IP": normalized["Dst IP"].astype("string"),
+            "Dst Port": pd.to_numeric(normalized["Dst Port"], errors="coerce"),
+            "SYN Flag Cnt": pd.to_numeric(normalized["SYN Flag Cnt"], errors="coerce"),
+            "ACK Flag Cnt": pd.to_numeric(normalized["ACK Flag Cnt"], errors="coerce"),
+            "_bytes": pd.to_numeric(normalized["TotLen Fwd Pkts"], errors="coerce")
+            + pd.to_numeric(normalized["TotLen Bwd Pkts"], errors="coerce"),
+            "_packets": pd.to_numeric(normalized["Tot Fwd Pkts"], errors="coerce")
+            + pd.to_numeric(normalized["Tot Bwd Pkts"], errors="coerce"),
+        },
+        index=normalized.index,
+    )
+
+    usable = work["_epoch"].notna() & work["Src IP"].notna() & work["Dst IP"].notna()
+    result = pd.DataFrame(
+        np.nan, index=flows.index, columns=list(WINDOW_FEATURE_NAMES), dtype=np.float32
+    )
+    if not usable.any():
+        return result
+
+    valid = work.loc[usable].fillna({"SYN Flag Cnt": 0.0, "ACK Flag Cnt": 0.0,
+                                     "_bytes": 0.0, "_packets": 0.0, "Dst Port": -1})
+    for seconds_in_window in WINDOW_SECONDS:
+        block = _window_block(valid, seconds_in_window)
+        result.loc[usable, block.columns] = block.to_numpy()
+    return result
+
+
+def _sidecar_key(csv_path: Path) -> str:
+    """Identify a sidecar by its source file and the definition that built it.
+
+    The resolved absolute path is part of the key because discover_csv_files
+    globs recursively, so two capture files can share a stem; a stem-keyed
+    cache would join one file's window values onto another file's rows with no
+    error anywhere. The contract and window definition are part of it so that
+    editing WINDOW_SECONDS does not leave stale sidecars looking fresh.
+    """
+
+    stats = csv_path.stat()
+    material = "|".join(
+        [
+            str(csv_path.resolve()),
+            str(stats.st_mtime_ns),
+            str(stats.st_size),
+            str(FEATURE_CONTRACT_VERSION),
+            str(WINDOW_SECONDS),
+            str(WINDOW_FEATURE_NAMES),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def resolve_window_cache_dir(preferred: str | Path) -> Path:
+    """Return a writable cache directory, falling back to a temporary one.
+
+    On Colab the natural location sits inside the kagglehub download cache,
+    which is not guaranteed writable. Losing the cache is cheap; failing the
+    training run over it is not.
+    """
+
+    candidate = Path(preferred)
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write-probe"
+        probe.touch()
+        probe.unlink()
+        return candidate
+    except OSError as error:
+        fallback = Path(tempfile.gettempdir()) / "network-anomaly-window-cache"
+        fallback.mkdir(parents=True, exist_ok=True)
+        logger.warning(
+            "Window cache directory %s is not writable (%s); using %s instead",
+            candidate,
+            error,
+            fallback,
+        )
+        return fallback
+
+
+def build_window_sidecar(
+    csv_path: str | Path, cache_dir: str | Path, rebuild: bool = False
+) -> Path:
+    """Compute a whole-file window block once and cache it beside the input.
+
+    Window aggregates cannot be computed per chunk: a groupby inside a 100k-row
+    slice is not the same number as over the file, and the baseline delta needs
+    a bucket that lives in the previous slice. So the whole file is read once,
+    through the narrow set of identity and measurement columns, and the result
+    is joined back to each training chunk by row position.
+    """
+
+    csv_path = Path(csv_path)
+    cache = resolve_window_cache_dir(cache_dir)
+    sidecar = cache / f"{csv_path.stem}.{_sidecar_key(csv_path)}.window.parquet"
+    if sidecar.is_file() and not rebuild:
+        return sidecar
+
+    wanted = set(WINDOW_INPUT_COLUMNS)
+    # A callable usecols silently ignores names a file does not have, while a
+    # list raises. That tolerance is what lets identity columns be requested
+    # unconditionally, including on corpus days that ship without addresses.
+    frame = pd.read_csv(
+        csv_path,
+        usecols=lambda name: canonical_name(name) in wanted,
+        low_memory=False,
+    )
+    computed = compute_window_features(frame, strict=False)
+
+    handle, staging = tempfile.mkstemp(dir=cache, suffix=".parquet")
+    os.close(handle)
+    try:
+        computed.to_parquet(staging, index=False)
+        os.replace(staging, sidecar)
+    except BaseException:
+        Path(staging).unlink(missing_ok=True)
+        raise
+    return sidecar
 
 
 class ContractMismatchError(ValueError):
@@ -407,10 +691,33 @@ class FeatureContract:
         scale = np.asarray(self.scale, dtype=np.float32)
         return ((transformed - mean) / scale).astype(np.float32, copy=False)
 
+    def with_window_features(self, flows: pd.DataFrame) -> pd.DataFrame:
+        """Attach the declared window block, unless the caller already did.
+
+        Training joins a precomputed sidecar and passes the result through, so
+        columns already present are trusted rather than recomputed. That is what
+        keeps the trainer and the runtime on one set of values.
+        """
+
+        if not self.window_features:
+            return flows
+        if all(name in flows.columns for name in self.window_features):
+            return flows
+
+        available, missing = window_inputs_available(flows)
+        if not available:
+            raise ValueError(
+                "This bundle declares a window feature block, so scoring needs "
+                "the flow identity columns it is computed from. Missing: "
+                + ", ".join(missing)
+            )
+        computed = compute_window_features(flows)
+        return pd.concat([flows, computed], axis=1)
+
     def prepare(self, flows: pd.DataFrame) -> np.ndarray:
         """Normalize, validate and transform a batch into model input."""
 
-        normalized = normalize_columns(flows)
+        normalized = self.with_window_features(normalize_columns(flows))
         return self.transform_values(self.select(normalized))
 
 
@@ -421,9 +728,15 @@ def epoch_seconds(timestamps: pd.Series) -> pd.Series:
     pandas resolves datetimes to datetime64[us] in 3.x and datetime64[ns] in
     2.x, so a hardcoded division by 1e9 is wrong on one of them and would
     silently misbucket every row rather than raising.
+
+    NaT maps to NaN, not to the int64 sentinel that a bare astype produces.
+    Without that, an unparseable timestamp becomes a large negative epoch that
+    reads as a perfectly valid row and lands in a bucket of its own.
     """
 
-    return timestamps.astype("datetime64[ns]").astype("int64") / 1e9
+    nanoseconds = timestamps.astype("datetime64[ns]")
+    seconds = nanoseconds.astype("int64") / 1e9
+    return seconds.where(nanoseconds.notna())
 
 
 __all__ = [
@@ -437,8 +750,17 @@ __all__ = [
     "IDENTITY_COLUMNS",
     "MISSING_VALUE_POLICY",
     "TRANSFORM",
+    "WINDOW_FEATURE_NAMES",
+    "WINDOW_INPUT_COLUMNS",
+    "WINDOW_SECONDS",
     "WINDOW_SOURCE_COLUMNS",
+    "build_window_sidecar",
+    "canonical_name",
+    "compute_window_features",
     "epoch_seconds",
     "normalize_columns",
     "parse_timestamps",
+    "resolve_window_cache_dir",
+    "window_coverage_warning",
+    "window_inputs_available",
 ]
