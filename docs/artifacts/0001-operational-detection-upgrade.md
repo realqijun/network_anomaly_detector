@@ -1,11 +1,12 @@
 # 0001 - Operational detection upgrade
 
 Issues: #4, #5 (partial), #6, #7 (partial), #8, #9, #10.
-Status: plan, revision 2 after review.
+Status: plan, revision 3 after two review rounds.
 Branch: `claude/dazzling-clarke-200d7v`.
 Base: `fix/issue-3-unify-runtime` (open PR #11), because issue #3 is complete but not yet merged into `main`.
 
-Revision 2 reworks the window-feature mechanism, the operational-metric sampling basis, the explanation basis for unknown anomalies, the commit order, and the scope of issues #5 and #7.
+Revision 2 reworked the window-feature mechanism, the operational-metric sampling basis, the explanation basis for unknown anomalies, the commit order, and the scope of issues #5 and #7.
+Revision 3 fixes what revision 2 introduced: the sidecar cache location and key, the sampled-numerator false-positive rate, the benign-hours denominator, corpus-wide filename disambiguation, and the CI torch install.
 The rejected designs are recorded at the end so they are not re-proposed.
 
 ## Why these issues are one change
@@ -153,17 +154,41 @@ A `groupby` inside a chunk is not the same number as over the file: measured on 
 
 The mechanism is a **whole-file window pre-pass writing a per-file sidecar**:
 
-1. `build_window_sidecar(csv_path, cache_dir)` reads only `IDENTITY_COLUMNS + WINDOW_SOURCE_COLUMNS` from the file, which is about nine columns of roughly eighty, and casts IP columns to pandas categoricals to bound memory.
+1. `build_window_sidecar(csv_path, cache_dir)` reads only `IDENTITY_COLUMNS + WINDOW_SOURCE_COLUMNS` from the file, which is twelve distinct columns of roughly eighty, and casts IP columns to pandas categoricals to bound memory.
 2. It calls `compute_window_features` once over the complete file and writes the 33 float32 columns to `cache_dir/<file stem>.window.parquet`, indexed by original row position.
 3. `_read_chunks` gains an explicit `identity_columns` argument unioned into `usecols`, because `infer_feature_columns` has already dropped `Timestamp`, `Src IP` and `Dst IP` via `DEFAULT_EXCLUDED_COLUMNS`, so today they are never loaded at all.
    Each chunk then joins its slice of the sidecar by row position.
 4. `_clean_chunk` filters rows (unmapped label, non-finite features) **after** the join, so a dropped row takes its sidecar row with it.
    Window values are therefore always file-global and never depend on which rows survived filtering, which matches inference, where `Detector` drops nothing and raises instead.
 
-The sidecar is a cache: `TrainingConfig.window_cache_dir` defaults to `<output_dir>/.window_cache`, it is keyed by file stem plus source mtime and size, and it is rebuilt when stale.
+The sidecar is a cache, and its location and key both matter.
+
+`TrainingConfig.window_cache_dir` defaults to `<data_dir>/.window_cache`, **not** under `output_dir`.
+The cache is a derivative of the input, not of the output, and putting it under `output_dir` would sweep it into the downloadable bundle: `training_pipeline.py:642` calls `shutil.make_archive(str(output_dir), "zip", root_dir=output_dir)`, which recurses into dot-directories, so 33 float32 columns over multi-million-row files would turn a few-megabyte archive into several gigabytes and the bundle would stop being an immutable manifest plus weights.
+
+The cache key is a hash of the **resolved absolute path**, mtime, size, `FEATURE_CONTRACT_VERSION`, `WINDOW_SECONDS`, and `tuple(WINDOW_FEATURE_NAMES)`.
+The absolute path matters because `discover_csv_files` globs `**/*.csv` (`training_pipeline.py:117-121`) and the Kaggle download path is nested, so two files can share a stem; a stem-keyed cache would feed one file's window features onto another file's rows with no error anywhere.
+The version and window definition matter because editing `WINDOW_SECONDS` would otherwise leave stale sidecars that still look fresh by mtime and size.
+
+Sidecars are written to a temporary name and moved into place with `os.replace`, so a killed Colab run cannot leave a half-written parquet that the next run treats as valid.
+`TrainingConfig.rebuild_window_cache` forces a rebuild, and the total cache size is logged after each build so a bounded Colab disk does not fill silently.
 
 Because both sides now call `compute_window_features` over a complete frame, parity is exact by construction rather than by hope.
 The parity test enforces it the way the reviewer specified: the trainer path over a file deliberately read in at least three chunks, versus `Detector.prepare` over the same file read whole, asserting matrix equality, not two calls into the same helper.
+
+#### Window features are scoped to the frame they are given
+
+This is inherent to the design rather than a defect, but it is stated so nobody is surprised by it.
+
+At training, a frame is a whole CSV file.
+At inference, `deploy/app.py:104` reads whatever the user uploaded.
+Someone who uploads 40 hand-picked flows gets `win60s_dst_flow_count` near 1 on every row, a vector far outside the training distribution, and a confident score with nothing indicating the input could not support the window block.
+
+Two cheap mitigations land in commit 7b.
+`FeatureContract.prepare` emits a coverage warning when the frame's `Timestamp` span is shorter than `max(WINDOW_SECONDS)` or its row count is below a floor, and `deploy/app.py` renders that warning as a coverage note.
+
+The sidecar is **file-scoped**.
+If a capture group ever contains multiple shards, the sidecar must be built over the concatenated group rather than per file, otherwise a 60-second bucket spanning a shard boundary is split, which is the per-chunk bug again at file scale.
 
 `enable_window_features` is tri-state, because a silent degrade would let the default configuration produce a bundle that closes #6 on paper while containing zero window features:
 
@@ -174,13 +199,17 @@ The parity test enforces it the way the reviewer specified: the trainer path ove
 
 `deploy/app.py` renders a coverage banner when the loaded bundle declares no window block, satisfying `CONTEXT.md`'s rule that missing telemetry must be visible to the user.
 
+`"require"` stays the library default because loud is right, but the notebook's cell 7 sets `enable_window_features="auto"` explicitly, with a comment saying why.
+Several days of the Kaggle mirror ship no `Src IP` or `Dst IP`, so leaving the notebook on the default would make the first documented training run after this PR fail hard.
+
 #### The contract object
 
 `FeatureContract` is a frozen dataclass holding `version`, `flow_features`, `window_features`, `transform`, `mean`, `scale`, `missing_value_policy`, `window_seconds`, and `window_features_disabled_reason`.
 
 - `feature_names` is `flow_features + window_features`, the ordered model input.
 - `prepare(frame)` is the single transform: normalize columns, compute or accept window features, check for missing columns, coerce to numeric, reject non-finite, signed log1p, standardize.
-- `to_manifest()` and `from_manifest()` round-trip, with `from_manifest` applying the version precedence above.
+- `to_manifest()` and `from_manifest()` round-trip.
+  `from_manifest` applies the version precedence above and tests **membership in `COMPATIBLE_CONTRACT_VERSIONS`**, not equality with `FEATURE_CONTRACT_VERSION`, otherwise the compatible set would never do anything.
 
 Non-finite handling stays `reject`, matching what issue #3 landed.
 
@@ -189,14 +218,23 @@ Non-finite handling stays `reject`, matching what issue #3 landed.
 `capture_group(path)` derives a stable whole-capture group key from a filename.
 The corpus naming is an **unverified assumption** and the plan says so rather than hiding it: the notebook downloads `solarmainframe/ids-intrusion-csv`, commonly mirrored as `02-14-2018.csv` (MM-DD-YYYY), while `TrainingConfig.validation_patterns` defaults to `("16-02-2018", ...)` (DD-MM-YYYY).
 If the mirror is MM-DD-YYYY then `partition_csv_files` raises "None of the validation_patterns matched" before training starts today, which would be a pre-existing bug this PR must not preserve behind a new module.
-No Kaggle credentials are available here, so `capture_group` is written to handle the ambiguity rather than to bet on one convention:
+No Kaggle credentials are available here, so the convention is resolved **once per corpus**, never per file.
+Per-file disambiguation was the revision 2 design and it is wrong: over mirror-style names, `02-14-2018` through `02-28-2018` all resolve month-first, but `03-01-2018` and `03-02-2018` have both fields at or below 12 and would fall back to the raw stem.
+One directory would then yield keys in two namespaces, and the stem fallback would split `03-01-2018_part1.csv` and `03-01-2018_part2.csv` into two groups, which is exactly the leakage #5 exists to prevent.
 
-- match any `NN-NN-YYYY` or `YYYY-NN-NN` token and disambiguate by magnitude, first field above 12 means day-first, second field above 12 means month-first;
-- when genuinely ambiguous, fall back to the raw filename stem, which is still a valid whole-file group key;
-- normalize a recognized date to `YYYY-MM-DD` so both conventions collapse to one key.
+`resolve_capture_convention(paths)` scans every filename first:
 
-`validation_patterns` are matched against the **group key and the filename**, and the "nothing matched" error lists the actual group keys found, so a wrong convention is diagnosable in one run instead of guessed at.
-The defaults are updated to the MM-DD-YYYY spellings with a comment recording why, and both spellings are covered by tests.
+- if any filename has a first field above 12 the corpus is day-first;
+- if any has a second field above 12 the corpus is month-first;
+- a corpus exhibiting both raises, naming the two offending files;
+- a corpus exhibiting neither is genuinely ambiguous and falls back to stem grouping for every file, so the namespace stays consistent.
+
+`capture_group(path, convention)` then applies that single convention to every file and normalizes to `YYYY-MM-DD`.
+Whenever a date token is present at all it groups on the date, and a trailing shard suffix is stripped, so shards of one capture day always share a group key.
+
+`validation_patterns` are matched against the **group key and the filename**, and the "nothing matched" error lists the actual group keys found, so a wrong convention is diagnosable in one run.
+The defaults become **normalized keys** (`"2018-02-16"`, `"2018-02-21"`, `"2018-02-23"`, `"2018-03-01"`).
+That is correct under either convention, because `16-02-2018` day-first and `02-16-2018` month-first both normalize to `2018-02-16`, so this fixes the existing mismatch without betting on an unverified assumption.
 
 - `GroupedSplit` holds `train`, `validation`, `test`, `external_test`, and `group_key`.
 - `build_grouped_split(...)` assigns whole groups, never individual files from a shared group, so two shards of one capture day cannot land on opposite sides.
@@ -212,8 +250,8 @@ The existing assertion in `tests/test_training_pipeline.py:46-52` uses `day-20.c
 Pure functions over `(targets, probabilities, anomaly_scores, classes)`:
 
 - `precision_recall_auc(truth, scores)` via `average_precision_score`.
-- `false_positives_per_hour(truth, flagged, benign_hours)`.
-- `recall_at_false_positive_budget(truth, scores, budget_per_hour, benign_hours)`.
+- `false_positives_per_hour(truth, flagged, benign_hours, sampling_rate)`.
+- `recall_at_false_positive_budget(truth, scores, budget_per_hour, benign_hours, sampling_rate)`.
 - `top_k_precision(truth, scores, k)` for `k` in `(10, 50, 100)`.
 - `expected_calibration_error(truth, probabilities)`.
 
@@ -228,12 +266,26 @@ The fix separates two passes that were conflated:
 - **Model selection**, per epoch, keeps the existing per-class cap.
   It optimizes macro F1, which is prevalence-insensitive by design.
 - **Operational evaluation**, once, at the end, uses **uniform** subsampling, which preserves prevalence, bounded by `max_evaluation_rows` (default 5,000,000).
-  The manifest records `metrics.operational.prevalence_basis = {"sampling": "uniform", "rate": r, "rows_seen": n}`, so a reader can always tell what the numbers stand on.
+  The manifest records `metrics.operational.prevalence_basis = {"sampling": "uniform", "rate": r, "rows_seen": n}`.
+
+Recording the rate is not the same as applying it, and revision 2 recorded without applying.
+Counting false positives in a sample of rate `r` while dividing by a full-capture denominator reports `r` times the true rate, and the budget policy would then pick a threshold letting through `1/r` times the budget.
+So `sampling_rate` is an explicit argument to both false-positive functions, the false-positive count is scaled by `1/r`, and there is a test asserting that a rate of 0.5 doubles the reported rate for the same flagged count.
+
+`r` cannot be chosen mid-stream, because `r = max_evaluation_rows / total_rows` needs `total_rows` first.
+The profile pass below already walks every validation row cheaply, so it also returns the total row count and per-class counts, and `r` is derived from those before the evaluation pass starts.
 
 #### Benign hours
 
 `benign_hours` is never taken from the sampled evaluation frame, whose span is not the capture duration.
-`scan_benign_hours(validation_files)` is a dedicated cheap pass reading only `Timestamp` and `Label`, taking the min and max over benign rows per file and summing the per-file spans.
+
+`scan_validation_profile(validation_files)` is a dedicated cheap pass reading only `Timestamp` and `Label`.
+It returns benign hours, the total row count, and per-class counts, so it feeds both this metric and the sampling rate above.
+
+Benign hours are **not** the benign min-to-max span.
+CSE-CIC-IDS2018 days interleave benign and attack traffic all day, so that span is essentially the whole day and would include every attack hour, understating a metric issue #4 defines on benign-only captures.
+Instead the pass accumulates the set of 60-second buckets containing at least one benign row and sums their union, which is genuinely benign-occupied wall clock and costs nothing extra in a pass that is already reading `Timestamp`.
+
 `TrainingConfig.benign_hours_override` is the only other source, and the manifest records which was used under `metrics.operational.benign_hours_source`.
 
 #### Threshold policy
@@ -242,9 +294,12 @@ The fix separates two passes that were conflated:
 
 The budget policy is defined exactly, because revision 1 left the degenerate cases open:
 
-> Search the sorted unique benign anomaly scores, not a fixed grid.
+> Search the sorted unique benign anomaly scores, not a fixed grid, and **without** a sentinel above the maximum benign score.
 > Choose the smallest threshold whose realized false positives per hour is at or below `max_false_positives_per_hour`.
 > If no threshold satisfies the budget, raise and refuse to write the bundle, naming the best achievable rate.
+
+Excluding the sentinel is what makes the unreachable case reachable: the largest real candidate still flags at least one benign row, so a small enough budget genuinely cannot be met and the raise fires.
+Adding an above-all-scores sentinel would make every budget satisfiable by flagging nothing, and the promised test would have nothing to assert.
 
 Refusing to write is deliberate: a bundle whose `thresholds.anomaly` is whatever a loop left behind is worse than no bundle.
 There is a test for the unreachable-budget case.
@@ -252,6 +307,7 @@ There is a test for the unreachable-budget case.
 The returned `ThresholdPolicy` record (policy, driving parameter, threshold, realized rate) is written to `manifest["thresholds"]["policy"]`.
 
 `operational_metrics(...)` assembles the block, including per-family PR-AUC, into `manifest["metrics"]["operational"]`.
+Each per-family PR-AUC is recorded with its support, and a family whose positive support after uniform sampling falls below `min_family_support` (default 50) records `null` with the support rather than a noisy number, because rare families such as XSS and Infiltration will have very few positives.
 `TrainingConfig` gains `threshold_policy`, `max_false_positives_per_hour`, `top_k_values`, `benign_hours_override`, and `max_evaluation_rows`.
 
 ### `explain.py` - issue #8
@@ -269,6 +325,7 @@ There are **two bases**, because the runtime produces two kinds of non-benign ro
 `explanation_basis` is recorded per row, and `EXPLANATION_METHOD` is a mapping from basis key to method name, written into the manifest along with `EXPLANATION_VERSION = 1` so an explanation is tied to the model that produced it.
 
 `explain_rows(...)` returns, per row, a list of `{feature, contribution, observed_z, direction}` sorted by absolute contribution, `top_k` default 5.
+The reconstruction basis produces only non-negative contributions, so for those rows `direction` is defined as `sign(z_i - reconstruction_i)`, which carries the analyst-useful part: whether the observed value sat above or below what the benign model expected.
 `observed_z` is the standardized value, so "3.4 standard deviations above the training baseline" reads directly, satisfying the observed-versus-baseline requirement without shipping training data.
 
 Gradients cannot be taken inside the existing scoring loop: `Detector.detect` runs under `torch.inference_mode()` (`detector_runtime.py:160`), and a tensor produced there cannot later set `requires_grad_(True)` (`RuntimeError: Setting requires_grad=True on inference tensor outside InferenceMode is not allowed`).
@@ -300,9 +357,14 @@ Tests therefore build their own PCAP with scapy, and the repository fixtures are
 Workflow `CI` on `push` and `pull_request`, `ubuntu-latest`, Python 3.11:
 
 1. checkout;
-2. `pip install -r requirements-dev.txt`, with pip caching and the CPU torch index, because the default `torch` wheel is roughly 800 MB per run;
-3. `python -m compileall -q . -x '(legacy|\.git|\.venv|\.agents|\.claude)'`;
-4. `python -m unittest discover -s tests -t . -v`.
+2. `pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu`, because the default wheel is roughly 800 MB per run;
+3. `pip install -r requirements-dev.txt` from PyPI, which is a no-op for the already-satisfied torch pin;
+4. `python -m compileall -q . -x '(legacy|\.git|\.venv|\.agents|\.claude)'`;
+5. `python -m unittest discover -s tests -t . -v`.
+
+The install is two steps deliberately.
+The PyTorch CPU index does not serve Flask, scapy, pandas or scikit-learn, so a single `--index-url` install fails, and `--extra-index-url` would usually still pull the large PyPI torch wheel.
+Commit 1 exists to produce a green workflow, so getting this wrong would break the thing that validates everything after it.
 
 `requirements-dev.txt` is the root runtime pins **plus Flask and scapy**, because `requirements.txt` contains neither, while `tests/test_deploy_app.py:14` imports `app` (which imports Flask) and `tests/test_evidence.py` needs scapy.
 Revision 1's "runtime pins plus nothing else" would have gone red on a fresh runner.
@@ -322,8 +384,8 @@ Confirmed: adding the empty file makes that exact command pass with all 19 exist
 | `deploy/app.py` | Request `explain=True`; pass explanations to the template; render the window-coverage banner; surface a contract-mismatch load failure distinctly. No evidence wiring (deferred). |
 | `deploy/templates/results.html` | Per-row expandable "why this was flagged" list; coverage banner. |
 | `deploy/Dockerfile` | Copy `feature_contract.py` and `explain.py` next to `detector_runtime.py`; without this the image breaks on import (`deploy/Dockerfile:13-14` copies only `deploy/` and `detector_runtime.py`). |
-| `deploy/requirements.txt` | Unchanged; scapy stays pinned here. Root `requirements.txt` **adds** scapy rather than moving it, so the container keeps working. |
-| `notebooks/train_cse_cic_ids2018_colab.ipynb` | Cell 11 displays the operational block; cell 13 stops hand-preparing features now that the contract does it. |
+| `deploy/requirements.txt` | Unchanged; scapy stays pinned here. Nothing in the image imports scapy now that the evidence wiring is deferred, so this is a deliberate carry for the deferred follow-up, not an oversight. Root `requirements.txt` **adds** scapy rather than moving it. |
+| `notebooks/train_cse_cic_ids2018_colab.ipynb` | Cell 7 sets `enable_window_features="auto"` explicitly, with a comment, so the documented run survives mirror days that ship no `Src IP` or `Dst IP`; cell 11 displays the operational block; cell 13 stops hand-preparing features now that the contract does it. |
 | `tests/test_training_pipeline.py` | v2 fixture; assert the new manifest blocks. |
 | `tests/test_deploy_app.py` | v2 fixture; end-to-end smoke assertion that an explanation reaches the rendered page. |
 | `README.md` | Contract version and schema policy; operational metrics replacing the ROC-AUC framing; split policy; explanation limitation and the recorded deviation from the redesign note; the evidence CLI; local check commands. Also fix `README.md:41`, which still says CIC-IDS2017 while everything else says CSE-CIC-IDS2018. |
@@ -343,7 +405,7 @@ Each commit leaves `python -m unittest discover -s tests -t .` green.
    Issue #9.
 3. `feat: add temporal window aggregation features`
    `WINDOW_SECONDS`, `WINDOW_FEATURE_NAMES`, `compute_window_features`, `window_inputs_available`, `build_window_sidecar`, and pure unit tests only.
-   The parity test is **not** here, because the trainer is not wired until commit 7.
+   The parity test is **not** here, because the trainer is not wired until commit 7b.
    Issue #6.
 4. `feat: add leakage-resistant grouped split manifests`
    `splits.py` and `tests/test_splits.py`.
@@ -352,10 +414,13 @@ Each commit leaves `python -m unittest discover -s tests -t .` green.
    `evaluation.py` and `tests/test_evaluation.py`.
    Issue #4.
 6. `feat: add feature attribution for named detector signals`
-   `explain.py` plus `tests/test_explain.py` only; the `Detector.detect(explain=True)` wiring lands in commit 7 so `detector_runtime.py` is touched once.
+   `explain.py` plus `tests/test_explain.py` only; the `Detector.detect(explain=True)` wiring lands in commit 7a so `detector_runtime.py` is touched once.
    Issue #8.
-7. `refactor: adopt feature contract v2 across training and runtime`
-   `detector_runtime.py`, `training_pipeline.py`, `detector.py`, `deploy/pcap_parser.py`, `deploy/app.py`, `deploy/templates/results.html`, `deploy/Dockerfile`, the notebook, the two updated test modules, and the train-versus-inference parity test.
+7a. `refactor: adopt feature contract v2 in the runtime`
+   `detector_runtime.py` (contract adoption plus the `explain` second pass), `detector.py`, `deploy/pcap_parser.py`, `deploy/app.py`, `deploy/templates/results.html`, `deploy/Dockerfile`, and `tests/test_deploy_app.py`.
+7b. `refactor: adopt feature contract v2 in training`
+   `training_pipeline.py` (sidecar build and join, grouped splits, operational evaluation pass, v2 manifest), the coverage warning in `prepare`, the notebook, `tests/test_training_pipeline.py`, and the train-versus-inference parity test.
+   Split from 7a because that commit is otherwise the only one that can meaningfully break and it would carry nine files plus the parity test.
 8. `feat: add pcap evidence library and cli`
    `evidence.py` and `tests/test_evidence.py`.
    Issue #7, partial.
@@ -408,7 +473,7 @@ python -m unittest tests.test_feature_contract.WindowFeatureTests -v
 
 Verifies: 60 flows from 30 sources onto one destination within one second give `win1s_dst_unique_src == 30` and `win60s_dst_flow_count == 60`; a repeated pair raises `pair_flow_count`; a SYN-flood fixture drives `syn_ack_imbalance` positive; `dst_flow_count_delta` is zero in a destination's first bucket and positive in a growing one; a frame missing `Timestamp` raises naming the column instead of scoring.
 
-The parity test (in commit 7, `tests.test_training_pipeline`) is the one that matters:
+The parity test (in commit 7b, `tests.test_training_pipeline`) is the one that matters:
 write a fixture CSV, run the trainer path over it with `chunk_size` forced small enough to produce at least three chunks, run `Detector`'s prepare path over the same file read whole, and assert the two matrices are equal.
 
 Degrade visibility:
@@ -436,7 +501,14 @@ Verifies: `precision_recall_auc` matches `sklearn.average_precision_score` on a 
 python -m unittest tests.test_explain -v
 ```
 
-Verifies: for a network whose first layer weights exactly one feature, `explain_rows` ranks that feature first; `top_k` is respected; `Benign` rows carry no explanation; an `Unknown anomaly` row gets the reconstruction basis and its contributions sum to the reported `anomaly_score` times the feature count, which is the faithfulness check the decomposition makes possible; a named-family row gets the gradient basis; the manifest records the method mapping and version; the deploy smoke test asserts a contributing feature name appears in the rendered HTML.
+Verifies: for a network whose first layer weights exactly one feature, `explain_rows` ranks that feature first; `top_k` is respected; `Benign` rows carry no explanation; an `Unknown anomaly` row gets the reconstruction basis and its contributions sum to the reported `anomaly_score` times the feature count, which is the faithfulness check the decomposition makes possible; a named-family row gets the gradient basis.
+
+The two assertions that live elsewhere get their own commands, so each listed command produces the evidence listed under it:
+
+```sh
+python -m unittest tests.test_training_pipeline -v   # manifest records the method mapping and version
+python -m unittest tests.test_deploy_app -v          # a contributing feature name appears in the rendered HTML
+```
 
 **Issue #7, evidence.**
 
@@ -468,7 +540,13 @@ Recorded so they are not re-proposed.
 
 - **Per-chunk window aggregates.** Measured wrong: 120,000 of 250,000 rows differ from whole-file values, and `dst_flow_count_delta` is not computable inside a chunk at all.
 - **Bucket-aligned chunking with a one-bucket lookback.** This does give exact parity, including the delta feature, and was verified experimentally.
-  It is rejected anyway because it requires each file to be time-sorted, which these CSVs do not guarantee, and verifying sortedness costs a pass that the sidecar approach spends more usefully.
+  It is rejected for three reasons, in order of weight.
+  First, its memory is unbounded: a chunk must hold a complete bucket, and a 1-second bucket during an HOIC or LOIC burst can contain a very large number of flows, so `chunk_size` stops being a memory bound and becomes advisory, which regresses the streaming design `_read_chunks` exists for.
+  The sidecar's peak memory is bounded by twelve columns of one file with IP columns as categoricals, which is a number this plan can hold itself to.
+  Second, an unsorted file makes it produce silently wrong deltas rather than failing loudly, and these CSVs are known to carry repeated header rows mid-file; failing loudly on bad input is the standard this repo already holds elsewhere (`missing_value_policy: reject`).
+  Third, and structurally, the sidecar makes "compute window features over one complete frame" the single rule on both sides, whereas bucket-aligned chunking is a trainer IO strategy with no counterpart at inference, where the frame is an uploaded CSV.
+  The rule that holds on both sides is the one that belongs in the contract.
+  The accepted cost is one extra full read per file per corpus, amortized by the cache, plus the cache lifecycle that the location and key rules above exist to make safe.
 - **Dropping `dst_flow_count_delta` to 30 window features.** Unnecessary once the sidecar makes whole-file computation the norm, and the baseline-delta signal is explicitly requested by issue #6.
 - **Swapping the model family to gradient-boosted trees for explainability.** Defensible under the redesign note, but it would invalidate the bundle this PR is migrating and is not required by issue #8's acceptance criteria.
 - **Per-class capped sampling for operational metrics.** Destroys prevalence, which makes every metric in issue #4 meaningless.
@@ -481,5 +559,12 @@ That is intended by #9, and the error names the version and points at retraining
 The window sidecar adds a cache with a lifecycle.
 It is keyed by source mtime and size and rebuilt when stale, and a corrupt or unreadable sidecar is rebuilt rather than trusted.
 
+Several days of the Kaggle mirror ship no `Src IP` or `Dst IP`, so the window block cannot be built for them.
+That is why `enable_window_features` is tri-state and why the notebook sets `"auto"` while the library default stays `"require"`.
+A bundle always declares which blocks it was trained with, and inference fails closed only against the blocks that bundle actually declares.
+
+The anomaly threshold is selected on the same validation rows that `recall_at_false_positive_budget` is then reported from, so the reported recall is optimistically biased.
+This is pre-existing, but the plan now makes operational claims from it, so the README says so in one sentence.
+
 The capture-day filename convention is assumed, not verified, because no Kaggle credentials are available here.
-`capture_group` is written to handle both conventions and the failure message lists what it actually found, so the first real training run diagnoses it immediately instead of failing opaquely.
+The convention is resolved corpus-wide, the normalized defaults are correct under either reading, and the failure message lists the group keys actually found, so the first real training run diagnoses it immediately instead of failing opaquely.
