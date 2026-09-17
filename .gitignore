@@ -191,6 +191,7 @@ working/
 
 # Large training inputs and generated model bundles
 data/
-artifacts/
+# Root-anchored so docs/artifacts/ (plan records) stays tracked.
+/artifacts/
 model_bundle/
 *.zip
