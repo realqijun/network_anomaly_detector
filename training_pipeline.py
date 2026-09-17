@@ -10,7 +10,7 @@ import copy
 import json
 import math
 import random
-import shutil
+import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -24,7 +24,29 @@ from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 
-from detector_runtime import BUNDLE_FORMAT_VERSION, HybridDetectorNetwork
+from detector_runtime import HybridDetectorNetwork
+from evaluation import (
+    BENIGN_QUANTILE,
+    FALSE_POSITIVE_BUDGET,
+    operational_metrics,
+    select_anomaly_threshold,
+)
+from explain import EXPLANATION_METHOD, EXPLANATION_VERSION
+from feature_contract import (
+    BUNDLE_FORMAT_VERSION,
+    IDENTITY_COLUMNS,
+    WINDOW_FEATURE_NAMES,
+    WINDOW_SECONDS,
+    FeatureContract,
+    build_window_sidecar,
+    canonical_name,
+    epoch_seconds,
+    normalize_columns,
+    parse_timestamps,
+    resolve_window_cache_dir,
+    window_inputs_available,
+)
+from splits import build_grouped_split, split_manifest, validate_split_manifest
 
 
 DEFAULT_CLASSES = (
@@ -56,11 +78,13 @@ class TrainingConfig:
     data_dir: str
     output_dir: str = "artifacts/cse_cic_ids2018_bundle"
     csv_pattern: str = "**/*.csv"
+    # Normalized capture-group keys, so they select the same days whether the
+    # corpus names files day-first (16-02-2018) or month-first (02-16-2018).
     validation_patterns: tuple[str, ...] = (
-        "16-02-2018",
-        "21-02-2018",
-        "23-02-2018",
-        "01-03-2018",
+        "2018-02-16",
+        "2018-02-21",
+        "2018-02-23",
+        "2018-03-01",
     )
     chunk_size: int = 100_000
     scaler_rows_per_class_per_chunk: int = 2_000
@@ -79,6 +103,23 @@ class TrainingConfig:
     random_seed: int = 42
     excluded_columns: tuple[str, ...] = DEFAULT_EXCLUDED_COLUMNS
 
+    # Window features. "require" fails when the corpus carries no addresses,
+    # "auto" degrades and records why, "off" is explicit. The default is loud
+    # because a silently empty window block would close issue #6 on paper.
+    enable_window_features: str = "require"
+    window_cache_dir: str | None = None
+    rebuild_window_cache: bool = False
+
+    # Operational evaluation. Thresholds come from an alert budget rather than
+    # a ROC-derived cutoff, because the deployment constraint is how many
+    # alerts a person can actually read.
+    threshold_policy: str = FALSE_POSITIVE_BUDGET
+    max_false_positives_per_hour: float = 10.0
+    top_k_values: tuple[int, ...] = (10, 50, 100)
+    benign_hours_override: float | None = None
+    max_evaluation_rows: int = 5_000_000
+    min_family_support: int = 50
+
     def __post_init__(self) -> None:
         if self.chunk_size <= 0 or self.batch_size <= 0:
             raise ValueError("chunk_size and batch_size must be positive")
@@ -88,6 +129,18 @@ class TrainingConfig:
             raise ValueError("target_precision must be in [0.5, 1.0)")
         if not 0.9 <= self.anomaly_benign_quantile < 1.0:
             raise ValueError("anomaly_benign_quantile must be in [0.9, 1.0)")
+        if self.enable_window_features not in ("require", "auto", "off"):
+            raise ValueError(
+                "enable_window_features must be 'require', 'auto' or 'off'"
+            )
+        if self.threshold_policy not in (FALSE_POSITIVE_BUDGET, BENIGN_QUANTILE):
+            raise ValueError(f"Unknown threshold_policy {self.threshold_policy!r}")
+        if self.max_evaluation_rows <= 0:
+            raise ValueError("max_evaluation_rows must be positive")
+
+    @property
+    def resolved_window_cache_dir(self) -> str:
+        return self.window_cache_dir or str(Path(self.data_dir) / ".window_cache")
 
 
 def canonicalize_labels(labels: pd.Series) -> pd.Series:
@@ -124,19 +177,15 @@ def discover_csv_files(data_dir: str | Path, pattern: str = "**/*.csv") -> list[
 def partition_csv_files(
     files: Sequence[Path], validation_patterns: Sequence[str]
 ) -> tuple[list[Path], list[Path]]:
-    validation = [
-        path for path in files if any(pattern in path.name for pattern in validation_patterns)
-    ]
-    training = [path for path in files if path not in validation]
-    if not validation:
-        names = "\n".join(f"- {path.name}" for path in files)
-        raise ValueError(
-            "None of the validation_patterns matched a CSV filename. "
-            "Choose whole capture days from:\n" + names
-        )
-    if not training:
-        raise ValueError("Validation patterns selected every CSV; no training files remain")
-    return training, validation
+    """Training and validation files, split by whole capture group.
+
+    Kept as a two-tuple because the Colab notebook unpacks it that way. The
+    test and external-test partitions are reachable through
+    splits.build_grouped_split.
+    """
+
+    split = build_grouped_split(files, validation_patterns)
+    return split.train, split.validation
 
 
 def _normalized_columns(path: Path) -> list[str]:
@@ -172,28 +221,148 @@ def infer_feature_columns(
 
 
 def _read_chunks(
-    paths: Sequence[Path], columns: Sequence[str], chunk_size: int
+    paths: Sequence[Path],
+    columns: Sequence[str],
+    chunk_size: int,
+    identity_columns: Sequence[str] = (),
+    sidecars: dict[Path, Path] | None = None,
 ) -> Iterator[tuple[Path, pd.DataFrame]]:
-    usecols = list(columns) + ["Label"]
+    """Stream capture files in chunks, joining each file's window sidecar.
+
+    usecols stays a callable rather than a list. A callable silently ignores
+    names a file does not have, while a list raises, and that tolerance is what
+    lets identity columns be requested unconditionally, including on corpus days
+    that ship without addresses.
+
+    The sidecar is joined by row position, which is only sound because it is
+    built at full file length. Filtering happens downstream, after the join.
+    """
+
+    wanted = set(columns) | {"Label"} | set(identity_columns)
     for path in paths:
-        for chunk in pd.read_csv(path, usecols=lambda name: name.strip() in usecols, chunksize=chunk_size):
-            chunk.columns = chunk.columns.str.strip()
+        sidecar = None
+        if sidecars and path in sidecars:
+            sidecar = pd.read_parquet(sidecars[path])
+
+        offset = 0
+        for chunk in pd.read_csv(
+            path,
+            usecols=lambda name: canonical_name(name) in wanted,
+            chunksize=chunk_size,
+            low_memory=False,
+        ):
+            chunk = normalize_columns(chunk).reset_index(drop=True)
             if "Label" not in chunk:
                 raise ValueError(f"{path} does not contain a Label column")
+
+            if sidecar is not None:
+                block = sidecar.iloc[offset : offset + len(chunk)].reset_index(drop=True)
+                if len(block) != len(chunk):
+                    raise ValueError(
+                        f"Window sidecar for {path} has {len(sidecar)} rows but the "
+                        "capture has more; the cache is stale, rebuild it"
+                    )
+                chunk = pd.concat([chunk, block], axis=1)
+
+            offset += len(chunk)
             yield path, chunk
 
 
 def _clean_chunk(
     chunk: pd.DataFrame, feature_columns: Sequence[str]
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Drop unusable rows and apply the contract transform's first half.
+
+    Filtering happens here, after the sidecar join, so a dropped row takes its
+    window values with it and the remaining rows keep the file-global values
+    inference will compute for them.
+    """
+
     labels = canonicalize_labels(chunk["Label"])
-    numeric = chunk.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce")
+    missing = [name for name in feature_columns if name not in chunk.columns]
+    if missing:
+        raise ValueError(
+            f"Chunk is missing contract features: {', '.join(missing[:8])}"
+        )
+    numeric = chunk.loc[:, list(feature_columns)].apply(pd.to_numeric, errors="coerce")
     values = numeric.to_numpy(dtype=np.float32, copy=True)
     valid = labels.notna().to_numpy() & np.isfinite(values).all(axis=1)
     values = values[valid]
     clean_labels = labels.loc[valid].astype(str).to_numpy()
     values = np.sign(values) * np.log1p(np.abs(values))
     return values.astype(np.float32, copy=False), clean_labels
+
+
+def build_window_sidecars(
+    files: Sequence[Path], config: TrainingConfig
+) -> dict[Path, Path]:
+    """Precompute one whole-file window block per capture file."""
+
+    cache = resolve_window_cache_dir(config.resolved_window_cache_dir)
+    sidecars: dict[Path, Path] = {}
+    total = 0
+    for path in files:
+        sidecar = build_window_sidecar(path, cache, rebuild=config.rebuild_window_cache)
+        sidecars[path] = sidecar
+        total += sidecar.stat().st_size
+    print(f"Window cache: {len(sidecars)} sidecars, {total / 1024**2:,.1f} MiB in {cache}")
+    return sidecars
+
+
+def resolve_window_support(
+    training_files: Sequence[Path], config: TrainingConfig
+) -> tuple[bool, str | None]:
+    """Decide whether this run gets a window block, and record why if not."""
+
+    if config.enable_window_features == "off":
+        return False, "disabled by configuration (enable_window_features='off')"
+
+    sample = normalize_columns(pd.read_csv(training_files[0], nrows=1))
+    available, missing = window_inputs_available(sample)
+    if available:
+        return True, None
+
+    reason = (
+        "capture files do not carry the flow identity columns window features "
+        f"are computed from; missing: {', '.join(missing)}"
+    )
+    if config.enable_window_features == "require":
+        raise ValueError(
+            "enable_window_features='require' but " + reason + ". Use 'auto' to "
+            "train without the window block, or point at a corpus that carries "
+            "addresses and timestamps."
+        )
+    print(f"Window features disabled: {reason}")
+    return False, reason
+
+
+def iter_prepared_chunks(
+    files: Sequence[Path],
+    contract: FeatureContract,
+    config: TrainingConfig,
+    sidecars: dict[Path, Path] | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield the exact model-input matrices training sees, chunk by chunk.
+
+    This is the trainer's view of the data, exposed so that it can be compared
+    against what Detector computes for the same capture read whole. If those
+    two disagree on one value, every metric a bundle reports is measured
+    against inputs the deployment will never see.
+    """
+
+    if sidecars is None and contract.window_features:
+        sidecars = build_window_sidecars(files, config)
+
+    for _, chunk in _read_chunks(
+        files,
+        contract.flow_features,
+        config.chunk_size,
+        identity_columns=IDENTITY_COLUMNS,
+        sidecars=sidecars,
+    ):
+        values, labels = _clean_chunk(chunk, contract.feature_names)
+        if len(values):
+            yield contract.standardize(values), labels
 
 
 def _sample_per_class(
@@ -219,13 +388,25 @@ def fit_feature_contract(
     training_files: Sequence[Path],
     feature_columns: Sequence[str],
     config: TrainingConfig,
-) -> tuple[StandardScaler, Counter[str]]:
+    window_features: Sequence[str] = (),
+    window_disabled_reason: str | None = None,
+    sidecars: dict[Path, Path] | None = None,
+) -> tuple[FeatureContract, Counter[str]]:
+    """Fit the scaler by streaming, and return the contract it belongs to."""
+
     scaler = StandardScaler()
     counts: Counter[str] = Counter()
     rng = np.random.default_rng(config.random_seed)
+    names = list(feature_columns) + list(window_features)
 
-    for _, chunk in _read_chunks(training_files, feature_columns, config.chunk_size):
-        values, labels = _clean_chunk(chunk, feature_columns)
+    for _, chunk in _read_chunks(
+        training_files,
+        feature_columns,
+        config.chunk_size,
+        identity_columns=IDENTITY_COLUMNS,
+        sidecars=sidecars,
+    ):
+        values, labels = _clean_chunk(chunk, names)
         counts.update(labels.tolist())
         values, _ = _sample_per_class(
             values,
@@ -238,7 +419,172 @@ def fit_feature_contract(
 
     if not hasattr(scaler, "mean_"):
         raise ValueError("No valid training rows were available to fit preprocessing")
-    return scaler, counts
+
+    scale = np.asarray(scaler.scale_, dtype=np.float64)
+    scale[scale <= 0] = 1.0
+    contract = FeatureContract(
+        flow_features=tuple(feature_columns),
+        window_features=tuple(window_features),
+        window_seconds=tuple(WINDOW_SECONDS) if window_features else (),
+        window_features_disabled_reason=window_disabled_reason,
+        mean=tuple(np.asarray(scaler.mean_, dtype=float).tolist()),
+        scale=tuple(scale.tolist()),
+    )
+    return contract, counts
+
+
+@dataclass(frozen=True)
+class ValidationProfile:
+    """A cheap, complete picture of the validation corpus.
+
+    Both the false-positive denominator and the evaluation sampling rate need
+    totals over every row, and neither can come from a sample: the rate cannot
+    be chosen before the row count is known, and the span of a sample is not
+    the duration of a capture.
+    """
+
+    benign_hours: float
+    benign_hours_source: str
+    total_rows: int
+    class_counts: dict[str, int]
+
+    def sampling_rate(self, max_rows: int) -> float:
+        if self.total_rows <= max_rows:
+            return 1.0
+        return float(max_rows / self.total_rows)
+
+
+_BENIGN_BUCKET_SECONDS = 60
+
+
+def scan_validation_profile(
+    files: Sequence[Path], config: TrainingConfig
+) -> ValidationProfile:
+    """Read Timestamp and Label only, and total up what evaluation needs.
+
+    Benign hours are the union of one-minute buckets containing at least one
+    benign row, not the benign min-to-max span. These days interleave benign
+    and attack traffic throughout, so that span is essentially the whole day
+    and would count every attack hour against a benign-only metric.
+    """
+
+    counts: Counter[str] = Counter()
+    benign_buckets: set[int] = set()
+    total_rows = 0
+    saw_timestamp = False
+
+    wanted = {"Timestamp", "Label"}
+    for path in files:
+        for chunk in pd.read_csv(
+            path,
+            usecols=lambda name: canonical_name(name) in wanted,
+            chunksize=config.chunk_size,
+            low_memory=False,
+        ):
+            chunk = normalize_columns(chunk)
+            labels = canonicalize_labels(chunk["Label"])
+            total_rows += len(chunk)
+            counts.update(labels.dropna().astype(str).tolist())
+
+            if "Timestamp" not in chunk.columns:
+                continue
+            saw_timestamp = True
+            seconds = epoch_seconds(parse_timestamps(chunk["Timestamp"], strict=False))
+            benign = labels.eq("Benign").to_numpy() & seconds.notna().to_numpy()
+            if benign.any():
+                buckets = (seconds[benign] // _BENIGN_BUCKET_SECONDS).astype("int64")
+                benign_buckets.update(buckets.tolist())
+
+    if not total_rows:
+        raise ValueError("Validation files contain no rows")
+
+    if config.benign_hours_override is not None:
+        benign_hours = float(config.benign_hours_override)
+        source = "config.benign_hours_override"
+    elif saw_timestamp and benign_buckets:
+        benign_hours = len(benign_buckets) * _BENIGN_BUCKET_SECONDS / 3600.0
+        source = "union of benign-occupied 60s buckets in the validation files"
+    else:
+        raise ValueError(
+            "Cannot measure benign hours: validation files carry no usable "
+            "Timestamp column. Set TrainingConfig.benign_hours_override."
+        )
+
+    return ValidationProfile(
+        benign_hours=benign_hours,
+        benign_hours_source=source,
+        total_rows=total_rows,
+        class_counts=dict(counts),
+    )
+
+
+def _collect_operational(
+    model: HybridDetectorNetwork,
+    files: Sequence[Path],
+    contract: FeatureContract,
+    classes: Sequence[str],
+    config: TrainingConfig,
+    device: torch.device,
+    sampling_rate: float,
+    sidecars: dict[Path, Path] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Score validation rows with uniform, prevalence-preserving sampling.
+
+    The per-epoch pass caps each class, which is right for macro F1 and wrong
+    for everything operational: benign vastly outnumbers each attack family
+    here, so a per-class cap destroys the prevalence that false positives per
+    hour, top-K precision and PR-AUC are all measured against.
+    """
+
+    model.eval()
+    label_to_index = {label: index for index, label in enumerate(classes)}
+    rng = np.random.default_rng(config.random_seed + 2000)
+    probability_parts: list[np.ndarray] = []
+    score_parts: list[np.ndarray] = []
+    target_parts: list[np.ndarray] = []
+
+    with torch.inference_mode():
+        for _, chunk in _read_chunks(
+            files,
+            contract.flow_features,
+            config.chunk_size,
+            identity_columns=IDENTITY_COLUMNS,
+            sidecars=sidecars,
+        ):
+            values, labels = _clean_chunk(chunk, contract.feature_names)
+            known = np.isin(labels, classes)
+            values, labels = values[known], labels[known]
+            if not len(values):
+                continue
+
+            if sampling_rate < 1.0:
+                keep = rng.random(len(values)) < sampling_rate
+                values, labels = values[keep], labels[keep]
+                if not len(values):
+                    continue
+
+            values = contract.standardize(values)
+            targets = np.fromiter(
+                (label_to_index[label] for label in labels),
+                dtype=np.int64,
+                count=len(labels),
+            )
+            for selection in _batch_indices(len(values), config.batch_size):
+                features = torch.from_numpy(values[selection]).to(device)
+                logits, reconstruction = model(features)
+                probability_parts.append(torch.softmax(logits, dim=1).cpu().numpy())
+                score_parts.append(
+                    torch.mean((features - reconstruction) ** 2, dim=1).cpu().numpy()
+                )
+                target_parts.append(targets[selection])
+
+    if not target_parts:
+        raise ValueError("Operational evaluation produced no recognized rows")
+    return (
+        np.concatenate(target_parts),
+        np.concatenate(probability_parts),
+        np.concatenate(score_parts),
+    )
 
 
 def _active_classes(counts: Counter[str]) -> list[str]:
@@ -266,14 +612,14 @@ def _batch_indices(length: int, batch_size: int) -> Iterator[slice]:
 def _train_epoch(
     model: HybridDetectorNetwork,
     files: Sequence[Path],
-    feature_columns: Sequence[str],
-    scaler: StandardScaler,
+    contract: FeatureContract,
     classes: Sequence[str],
     optimizer: torch.optim.Optimizer,
     classification_loss: nn.Module,
     config: TrainingConfig,
     device: torch.device,
     epoch: int,
+    sidecars: dict[Path, Path] | None = None,
 ) -> dict[str, float]:
     model.train()
     rng = np.random.default_rng(config.random_seed + epoch)
@@ -283,8 +629,14 @@ def _train_epoch(
     total_loss = total_classification = total_reconstruction = 0.0
     batches = rows = 0
 
-    for _, chunk in _read_chunks(shuffled_files, feature_columns, config.chunk_size):
-        values, labels = _clean_chunk(chunk, feature_columns)
+    for _, chunk in _read_chunks(
+        shuffled_files,
+        contract.flow_features,
+        config.chunk_size,
+        identity_columns=IDENTITY_COLUMNS,
+        sidecars=sidecars,
+    ):
+        values, labels = _clean_chunk(chunk, contract.feature_names)
         known = np.isin(labels, classes)
         values, labels = values[known], labels[known]
         values, labels = _sample_per_class(
@@ -293,7 +645,7 @@ def _train_epoch(
         if not len(values):
             continue
 
-        values = scaler.transform(values).astype(np.float32)
+        values = contract.standardize(values)
         order = rng.permutation(len(values))
         values, labels = values[order], labels[order]
         targets = np.fromiter(
@@ -337,11 +689,11 @@ def _train_epoch(
 def _collect_validation(
     model: HybridDetectorNetwork,
     files: Sequence[Path],
-    feature_columns: Sequence[str],
-    scaler: StandardScaler,
+    contract: FeatureContract,
     classes: Sequence[str],
     config: TrainingConfig,
     device: torch.device,
+    sidecars: dict[Path, Path] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
     label_to_index = {label: index for index, label in enumerate(classes)}
@@ -352,8 +704,14 @@ def _collect_validation(
     rng = np.random.default_rng(config.random_seed + 1000)
 
     with torch.inference_mode():
-        for _, chunk in _read_chunks(files, feature_columns, config.chunk_size):
-            values, labels = _clean_chunk(chunk, feature_columns)
+        for _, chunk in _read_chunks(
+            files,
+            contract.flow_features,
+            config.chunk_size,
+            identity_columns=IDENTITY_COLUMNS,
+            sidecars=sidecars,
+        ):
+            values, labels = _clean_chunk(chunk, contract.feature_names)
             selections: list[np.ndarray] = []
             for label in classes:
                 available = remaining[label]
@@ -370,7 +728,7 @@ def _collect_validation(
             selected = np.concatenate(selections)
             rng.shuffle(selected)
             values, labels = values[selected], labels[selected]
-            values = scaler.transform(values).astype(np.float32)
+            values = contract.standardize(values)
             targets = np.fromiter(
                 (label_to_index[label] for label in labels),
                 dtype=np.int64,
@@ -426,7 +784,7 @@ def _calibrate_class_thresholds(
                 selected_threshold = float(threshold)
                 selected_recall = recall
         thresholds[label] = selected_threshold
-        reportable[label] = selected_recall >= 0.0
+        reportable[label] = bool(selected_recall >= 0.0)
     return thresholds, reportable
 
 
@@ -459,34 +817,40 @@ def _evaluate(
     return report, anomaly_threshold
 
 
+def _json_default(value):
+    """Make numpy scalars and Paths serializable.
+
+    sklearn metrics and numpy comparisons return numpy scalars, which json
+    refuses, and the failure only appears at the very end of a training run.
+    """
+
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _write_bundle(
     output_dir: Path,
     model: HybridDetectorNetwork,
-    scaler: StandardScaler,
-    feature_columns: Sequence[str],
+    contract: FeatureContract,
     classes: Sequence[str],
     class_thresholds: dict[str, float],
     reportable: dict[str, bool],
-    anomaly_threshold: float,
+    threshold_policy,
     metrics: dict,
     counts: Counter[str],
-    training_files: Sequence[Path],
-    validation_files: Sequence[Path],
+    split_block: dict,
     config: TrainingConfig,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    scale = np.asarray(scaler.scale_, dtype=np.float64)
-    scale[scale <= 0] = 1.0
     manifest = {
         "bundle_format_version": BUNDLE_FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "feature_contract": {
-            "features": list(feature_columns),
-            "transform": "signed_log1p_standardize",
-            "mean": np.asarray(scaler.mean_, dtype=float).tolist(),
-            "scale": scale.tolist(),
-            "missing_value_policy": "reject",
-        },
+        "feature_contract": contract.to_manifest(),
         "taxonomy": {
             "classes": list(classes),
             "reportable": reportable,
@@ -499,21 +863,42 @@ def _write_bundle(
             "dropout": config.dropout,
         },
         "thresholds": {
-            "anomaly": anomaly_threshold,
+            "anomaly": threshold_policy.threshold,
             "class_confidence": class_thresholds,
             "target_precision": config.target_precision,
+            "policy": threshold_policy.to_manifest(),
+        },
+        "explanation": {
+            "version": EXPLANATION_VERSION,
+            "methods": EXPLANATION_METHOD,
         },
         "training": {
             "dataset": "CSE-CIC-IDS2018",
             "label_counts": dict(counts),
-            "training_files": [path.name for path in training_files],
-            "validation_files": [path.name for path in validation_files],
+            "split_manifest": split_block,
             "config": asdict(config),
         },
         "metrics": metrics,
     }
     torch.save(model.state_dict(), output_dir / "model.pt")
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=_json_default)
+    )
+
+
+def _archive_bundle(output_dir: Path) -> str:
+    """Zip only the bundle's own files.
+
+    make_archive over the directory would sweep in anything that happens to sit
+    beside them, which is how a multi-gigabyte window cache could end up inside
+    a downloadable model bundle.
+    """
+
+    archive_path = str(output_dir) + ".zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in ("manifest.json", "model.pt"):
+            archive.write(output_dir / name, arcname=name)
+    return archive_path
 
 
 def train_detector(config: TrainingConfig) -> dict:
@@ -528,20 +913,41 @@ def train_detector(config: TrainingConfig) -> dict:
     print(f"Training device: {device}")
 
     all_files = discover_csv_files(config.data_dir, config.csv_pattern)
-    training_files, validation_files = partition_csv_files(
-        all_files, config.validation_patterns
-    )
-    print("Training files:", [path.name for path in training_files])
-    print("Validation files:", [path.name for path in validation_files])
+    split = build_grouped_split(all_files, config.validation_patterns)
+    split_block = split_manifest(split)
+    # Run the leakage guard against real runs, not only against tests.
+    validate_split_manifest(split_block)
+    training_files, validation_files = split.train, split.validation
+    print("Training groups:", split.train_groups)
+    print("Validation groups:", split.validation_groups)
 
     feature_columns = infer_feature_columns(training_files, config.excluded_columns)
-    print(f"Feature contract: {len(feature_columns)} common numeric fields")
-    scaler, counts = fit_feature_contract(training_files, feature_columns, config)
+    use_windows, window_reason = resolve_window_support(training_files, config)
+    window_features = tuple(WINDOW_FEATURE_NAMES) if use_windows else ()
+
+    sidecars = (
+        build_window_sidecars(list(training_files) + list(validation_files), config)
+        if use_windows
+        else None
+    )
+    print(
+        f"Feature contract: {len(feature_columns)} flow fields, "
+        f"{len(window_features)} window fields"
+    )
+
+    contract, counts = fit_feature_contract(
+        training_files,
+        feature_columns,
+        config,
+        window_features=window_features,
+        window_disabled_reason=window_reason,
+        sidecars=sidecars,
+    )
     classes = _active_classes(counts)
     print("Training label counts:", dict(counts))
 
     model = HybridDetectorNetwork(
-        input_dim=len(feature_columns),
+        input_dim=len(contract.feature_names),
         num_classes=len(classes),
         hidden_dims=config.hidden_dims,
         latent_dim=config.latent_dim,
@@ -561,23 +967,20 @@ def train_detector(config: TrainingConfig) -> dict:
         summary = _train_epoch(
             model,
             training_files,
-            feature_columns,
-            scaler,
+            contract,
             classes,
             optimizer,
             classification_loss,
             config,
             device,
             epoch,
+            sidecars=sidecars,
         )
+        # Model selection uses the per-class capped pass. Macro F1 is
+        # prevalence-insensitive, so capping is right here and wrong for the
+        # operational metrics below.
         targets, probabilities, anomaly_scores = _collect_validation(
-            model,
-            validation_files,
-            feature_columns,
-            scaler,
-            classes,
-            config,
-            device,
+            model, validation_files, contract, classes, config, device, sidecars
         )
         metrics, _ = _evaluate(
             targets,
@@ -599,16 +1002,11 @@ def train_detector(config: TrainingConfig) -> dict:
             best_state = copy.deepcopy(model.state_dict())
 
     model.load_state_dict(best_state)
+
     targets, probabilities, anomaly_scores = _collect_validation(
-        model,
-        validation_files,
-        feature_columns,
-        scaler,
-        classes,
-        config,
-        device,
+        model, validation_files, contract, classes, config, device, sidecars
     )
-    metrics, anomaly_threshold = _evaluate(
+    metrics, quantile_threshold = _evaluate(
         targets,
         probabilities,
         anomaly_scores,
@@ -617,46 +1015,95 @@ def train_detector(config: TrainingConfig) -> dict:
     )
     metrics["history"] = history
     class_thresholds, reportable = _calibrate_class_thresholds(
-        targets,
-        probabilities,
-        classes,
-        config.target_precision,
+        targets, probabilities, classes, config.target_precision
     )
+
+    # Operational evaluation is its own pass, over an unbiased sample.
+    profile = scan_validation_profile(validation_files, config)
+    sampling_rate = profile.sampling_rate(config.max_evaluation_rows)
+    print(
+        f"Operational evaluation: {profile.total_rows:,} validation rows, "
+        f"sampling rate {sampling_rate:.4f}, "
+        f"benign hours {profile.benign_hours:.2f} ({profile.benign_hours_source})"
+    )
+    operational_targets, operational_probabilities, operational_scores = (
+        _collect_operational(
+            model,
+            validation_files,
+            contract,
+            classes,
+            config,
+            device,
+            sampling_rate,
+            sidecars,
+        )
+    )
+    benign_index = classes.index("Benign")
+    binary_truth = (operational_targets != benign_index).astype(int)
+    threshold_policy = select_anomaly_threshold(
+        config.threshold_policy,
+        truth=binary_truth,
+        scores=operational_scores,
+        benign_hours=profile.benign_hours,
+        budget_per_hour=config.max_false_positives_per_hour,
+        quantile=config.anomaly_benign_quantile,
+        sampling_rate=sampling_rate,
+    )
+    metrics["operational"] = operational_metrics(
+        operational_targets,
+        operational_probabilities,
+        operational_scores,
+        classes,
+        benign_hours=profile.benign_hours,
+        benign_hours_source=profile.benign_hours_source,
+        anomaly_threshold=threshold_policy.threshold,
+        sampling_rate=sampling_rate,
+        top_k_values=config.top_k_values,
+        min_family_support=config.min_family_support,
+    )
+    metrics["benign_quantile_threshold"] = quantile_threshold
 
     output_dir = Path(config.output_dir)
     _write_bundle(
         output_dir,
         model,
-        scaler,
-        feature_columns,
+        contract,
         classes,
         class_thresholds,
         reportable,
-        anomaly_threshold,
+        threshold_policy,
         metrics,
         counts,
-        training_files,
-        validation_files,
+        split_block,
         config,
     )
-    archive_path = shutil.make_archive(str(output_dir), "zip", root_dir=output_dir)
+    archive_path = _archive_bundle(output_dir)
     print(f"Saved model bundle to {output_dir}")
     print(f"Saved downloadable archive to {archive_path}")
     return {
         "bundle_dir": str(output_dir),
         "archive_path": archive_path,
         "classes": classes,
-        "feature_columns": feature_columns,
+        "feature_columns": list(contract.feature_names),
         "metrics": metrics,
         "class_thresholds": class_thresholds,
-        "anomaly_threshold": anomaly_threshold,
+        "anomaly_threshold": threshold_policy.threshold,
+        "threshold_policy": threshold_policy.to_manifest(),
+        "split_manifest": split_block,
     }
 
 
 __all__ = [
     "TrainingConfig",
+    "ValidationProfile",
+    "build_window_sidecars",
     "canonicalize_labels",
     "discover_csv_files",
+    "fit_feature_contract",
+    "infer_feature_columns",
+    "iter_prepared_chunks",
     "partition_csv_files",
+    "resolve_window_support",
+    "scan_validation_profile",
     "train_detector",
 ]

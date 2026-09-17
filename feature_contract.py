@@ -683,13 +683,22 @@ class FeatureContract:
             )
         return values
 
-    def transform_values(self, values: np.ndarray) -> np.ndarray:
-        """Apply the fitted transform. The only implementation of it."""
+    def standardize(self, transformed: np.ndarray) -> np.ndarray:
+        """Centre and scale values that have already been signed-log1p'd.
 
-        transformed = _signed_log1p(values)
+        Training fits its scaler on signed-log1p values while streaming, so it
+        reaches this half on its own; everything else goes through
+        transform_values. Both share these fitted constants.
+        """
+
         mean = np.asarray(self.mean, dtype=np.float32)
         scale = np.asarray(self.scale, dtype=np.float32)
         return ((transformed - mean) / scale).astype(np.float32, copy=False)
+
+    def transform_values(self, values: np.ndarray) -> np.ndarray:
+        """Apply the fitted transform. The only implementation of it."""
+
+        return self.standardize(_signed_log1p(values))
 
     def with_window_features(self, flows: pd.DataFrame) -> pd.DataFrame:
         """Attach the declared window block, unless the caller already did.
