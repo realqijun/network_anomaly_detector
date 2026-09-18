@@ -56,6 +56,12 @@ def _rank(
             "feature": feature_names[index],
             "contribution": float(contributions[index]),
             "observed_z": float(observed[index]),
+            # Two different signs, deliberately named apart. `observed_side`
+            # describes where the value sat relative to the training baseline;
+            # `direction` describes whether the feature pushed the score up or
+            # down. Conflating them renders sentences that contradict the
+            # number they contain.
+            "observed_side": "above" if observed[index] >= 0 else "below",
             "direction": int(directions[index]),
             "basis": basis,
         }

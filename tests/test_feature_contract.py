@@ -269,5 +269,25 @@ class PrepareTests(unittest.TestCase):
             self._contract().prepare(frame)
 
 
+
+class EpochSecondsRangeTests(unittest.TestCase):
+    """A date outside the nanosecond range must not abort a whole capture."""
+
+    def test_converts_dates_beyond_the_nanosecond_range(self):
+        parsed = parse_timestamps(
+            pd.Series(["2018-02-14 08:00:00", "9999-01-01 00:00:00"])
+        )
+
+        seconds = epoch_seconds(parsed)
+
+        self.assertAlmostEqual(seconds.iloc[0], 1518595200.0, places=1)
+        self.assertGreater(seconds.iloc[1], 2.5e11)
+
+    def test_converts_dates_before_the_nanosecond_range(self):
+        parsed = parse_timestamps(pd.Series(["1500-01-01 00:00:00"]))
+
+        self.assertLess(epoch_seconds(parsed).iloc[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

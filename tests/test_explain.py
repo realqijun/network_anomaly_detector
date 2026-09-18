@@ -227,5 +227,55 @@ class ExplanationShapeTests(unittest.TestCase):
         self.assertEqual(len(explanations), 1)
 
 
+class RenderedSentenceTests(unittest.TestCase):
+    """The word in the sentence must match the number in the sentence.
+
+    `direction` is the sign of the contribution and `observed_z` is the
+    standardized value; their signs are unrelated. Rendering one with the
+    other produces analyst-facing text like "observed -1.27 standard
+    deviations above the training baseline".
+    """
+
+    def test_observed_side_always_agrees_with_the_sign_of_observed_z(self):
+        model = _zeroed_network(input_dim=6, num_classes=3)
+        torch.manual_seed(0)
+        prepared = np.random.default_rng(0).normal(size=(5, 6)).astype(np.float32)
+        names = tuple(f"f{index}" for index in range(6))
+
+        explanations = explain_rows(
+            model,
+            prepared,
+            names,
+            class_indices=np.array([0, 1, 2, 1, 0]),
+            use_reconstruction=np.array([True, False, True, False, True]),
+            top_k=6,
+        )
+
+        for row in explanations:
+            for item in row:
+                with self.subTest(feature=item["feature"]):
+                    expected = "above" if item["observed_z"] >= 0 else "below"
+                    self.assertEqual(item["observed_side"], expected)
+
+    def test_observed_side_is_independent_of_the_contribution_sign(self):
+        """A negative contribution on a positive value still reads 'above'."""
+
+        model = _network_routing_only(1)
+        prepared = np.array([[0.0, 4.0, 0.0]], dtype=np.float32)
+
+        explanations = explain_rows(
+            model,
+            prepared,
+            FEATURES,
+            class_indices=np.array([1]),
+            use_reconstruction=np.array([False]),
+            top_k=3,
+        )
+        item = next(entry for entry in explanations[0] if entry["feature"] == "Tot Fwd Pkts")
+
+        self.assertEqual(item["observed_side"], "above")
+        self.assertGreater(item["observed_z"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

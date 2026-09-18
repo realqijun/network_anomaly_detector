@@ -741,11 +741,14 @@ def epoch_seconds(timestamps: pd.Series) -> pd.Series:
     NaT maps to NaN, not to the int64 sentinel that a bare astype produces.
     Without that, an unparseable timestamp becomes a large negative epoch that
     reads as a perfectly valid row and lands in a bucket of its own.
+
+    Subtracting the epoch rather than casting to datetime64[ns] is what keeps
+    the promise above. A nanosecond cast overflows outside roughly 1678-2262,
+    so a single out-of-range date in a capture would raise and abort the whole
+    file, which is exactly what the NaN-preserving contract exists to prevent.
     """
 
-    nanoseconds = timestamps.astype("datetime64[ns]")
-    seconds = nanoseconds.astype("int64") / 1e9
-    return seconds.where(nanoseconds.notna())
+    return (timestamps - pd.Timestamp("1970-01-01")).dt.total_seconds()
 
 
 __all__ = [

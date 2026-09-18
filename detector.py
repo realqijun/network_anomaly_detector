@@ -61,11 +61,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             print(f"Row {position}: {detections.loc[position, 'prediction']}")
             for item in explanation:
-                side = "above" if item["direction"] >= 0 else "below"
                 print(
-                    f"  {item['feature']}: {item['observed_z']:.2f} standard "
-                    f"deviations {side} the training baseline "
-                    f"({item['basis']})"
+                    f"  {item['feature']}: observed {item['observed_z']:.2f} "
+                    f"standard deviations {item['observed_side']} the training "
+                    f"baseline ({item['basis']})"
                 )
     return 0
 

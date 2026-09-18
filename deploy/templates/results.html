@@ -75,7 +75,7 @@
                                 <strong>{{ item.feature }}</strong>
                                 observed {{ "%.2f"|format(item.observed_z) }} standard
                                 deviations
-                                {{ "above" if item.direction >= 0 else "below" }}
+                                {{ item.observed_side | default("above") }}
                                 the training baseline
                             </li>
                         {% endfor %}

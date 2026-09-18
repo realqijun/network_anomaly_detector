@@ -213,5 +213,54 @@ class SplitGuardTests(unittest.TestCase):
             self.assertIn("2018-02-16", str(caught.exception))
 
 
+class AliasedCorpusTests(unittest.TestCase):
+    """A corpus using CIC-IDS2017 long headers must train, not abort.
+
+    The contract advertises those aliases, so a corpus spelling its columns
+    that way has to reach the trainer. Regression guard: the feature contract
+    is built from canonical names, and _read_chunks selects on canonical
+    names, so raw spellings anywhere between them mean no column is ever read.
+    """
+
+    def setUp(self):
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.output = self.root / "bundle"
+        _corpus(self.root)
+        renames = {
+            "Tot Fwd Pkts": "Total Fwd Packets",
+            "Tot Bwd Pkts": "Total Backward Packets",
+            "TotLen Fwd Pkts": "Total Length of Fwd Packets",
+            "TotLen Bwd Pkts": "Total Length of Bwd Packets",
+            "SYN Flag Cnt": "SYN Flag Count",
+            "ACK Flag Cnt": "ACK Flag Count",
+            "Flow Byts/s": "Flow Bytes/s",
+            "Src IP": "Source IP",
+            "Dst IP": "Destination IP",
+            "Src Port": "Source Port",
+            "Dst Port": "Destination Port",
+        }
+        for path in sorted(self.root.glob("*.csv")):
+            pd.read_csv(path).rename(columns=renames).to_csv(path, index=False)
+
+    def test_trains_and_records_canonical_feature_names(self):
+        train_detector(_config(self.root, self.output))
+        contract = json.loads((self.output / "manifest.json").read_text())["feature_contract"]
+
+        self.assertIn("Tot Fwd Pkts", contract["flow_features"])
+        self.assertNotIn("Total Fwd Packets", contract["flow_features"])
+        self.assertTrue(contract["window_features"])
+
+    def test_the_bundle_scores_a_capture_in_either_spelling(self):
+        train_detector(_config(self.root, self.output))
+        detector = Detector(self.output, device="cpu")
+        long_form = pd.read_csv(self.root / "02-16-2018.csv")
+
+        detections = detector.detect(long_form)
+
+        self.assertEqual(len(detections), len(long_form))
+
+
 if __name__ == "__main__":
     unittest.main()

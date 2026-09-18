@@ -189,7 +189,16 @@ def partition_csv_files(
 
 
 def _normalized_columns(path: Path) -> list[str]:
-    return [str(column).strip() for column in pd.read_csv(path, nrows=0).columns]
+    """Header names as the contract knows them, not as the file spells them.
+
+    Everything downstream selects and validates on canonical names, so a
+    contract built from raw spellings would name columns that _read_chunks
+    never loads. That silently broke every corpus using the CIC-IDS2017 long
+    headers or CICFlowMeter output, while leaving CSE-CIC-IDS2018 working
+    because there the raw and canonical spellings happen to coincide.
+    """
+
+    return [canonical_name(column) for column in pd.read_csv(path, nrows=0).columns]
 
 
 def infer_feature_columns(
@@ -199,7 +208,7 @@ def infer_feature_columns(
     for path in training_files[1:]:
         common.intersection_update(_normalized_columns(path))
 
-    excluded = {column.casefold() for column in excluded_columns}
+    excluded = {canonical_name(column).casefold() for column in excluded_columns}
     ordered = [
         column
         for column in _normalized_columns(training_files[0])
@@ -208,8 +217,7 @@ def infer_feature_columns(
     if not ordered:
         raise ValueError("No common candidate features remain after exclusions")
 
-    sample = pd.read_csv(training_files[0], nrows=5_000)
-    sample.columns = sample.columns.str.strip()
+    sample = normalize_columns(pd.read_csv(training_files[0], nrows=5_000))
     numeric_features = []
     for column in ordered:
         numeric = pd.to_numeric(sample[column], errors="coerce")
