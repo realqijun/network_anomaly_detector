@@ -85,11 +85,24 @@ class CollectEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence[self.http_key].packet_count, 5)
 
     def test_both_directions_are_gathered_under_one_stream(self):
-        evidence = collect_evidence(self.pcap, [self.http_key])
-        udp_key = FlowKey.build("10.0.0.5", 5353, "10.0.0.5", 53, 17)
+        """Five packets, two directions, one entry: the key normalizes them."""
 
-        self.assertIsNotNone(evidence[self.http_key].stream_id)
-        self.assertNotIn(udp_key, evidence)
+        evidence = collect_evidence(self.pcap, [self.http_key])
+        found = evidence[self.http_key]
+
+        self.assertEqual(found.packet_count, 5)
+        self.assertTrue(found.http_requests)
+        self.assertTrue(found.http_responses)
+
+    def test_distinct_flows_get_distinct_stream_ids(self):
+        """assertIsNotNone would pass even if every flow shared one id."""
+
+        evidence = collect_evidence(self.pcap)
+
+        ids = [found.stream_id for found in evidence.values()]
+
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
 
     def test_records_the_observation_interval(self):
         evidence = collect_evidence(self.pcap, [self.http_key])

@@ -89,8 +89,11 @@ def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) ->
         host_pcap_path = os.path.join(host_upload_dir, pcap_filename)
         output_csv_name = f"{pcap_filename}.csv"
         local_csv_path = os.path.join(host_output_dir, output_csv_name)
+        # Resolve the same way probe_pcap_runtime did, so the probe and the
+        # run cannot disagree about which docker they found.
+        docker_path = shutil.which("docker") or "docker"
         command = [
-            "docker", "run", "--rm",
+            docker_path, "run", "--rm",
             "-v", f"{host_upload_dir}:/data/input",
             "-v", f"{host_output_dir}:/data/output",
             DOCKER_IMAGE,

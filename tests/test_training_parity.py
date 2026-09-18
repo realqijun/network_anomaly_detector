@@ -13,7 +13,11 @@ import numpy as np
 import pandas as pd
 
 from feature_contract import WINDOW_SECONDS, FeatureContract
-from training_pipeline import TrainingConfig, iter_prepared_chunks
+from training_pipeline import (
+    TrainingConfig,
+    build_window_sidecars,
+    iter_prepared_chunks,
+)
 
 FLOW_FEATURES = ("Flow Duration", "Tot Fwd Pkts")
 WINDOW_FEATURES = (
@@ -135,6 +139,50 @@ class TrainingInferenceParityTests(unittest.TestCase):
             # Every row of one destination shares one file-global 60s count, so
             # a chunked computation would produce several distinct values here.
             self.assertLessEqual(len(np.unique(np.round(trainer[:, column], 6))), 2)
+
+
+class SidecarGuardTests(unittest.TestCase):
+    """The join is positional, so a wrong-length sidecar must never be used."""
+
+    def _prepare(self, root, rows=60):
+        csv_path = root / "02-14-2018.csv"
+        _capture(rows).to_csv(csv_path, index=False)
+        config = TrainingConfig(
+            data_dir=str(root), chunk_size=25, window_cache_dir=str(root / "cache")
+        )
+        contract = FeatureContract(
+            flow_features=FLOW_FEATURES,
+            window_features=WINDOW_FEATURES,
+            window_seconds=WINDOW_SECONDS,
+            mean=(0.0,) * (len(FLOW_FEATURES) + len(WINDOW_FEATURES)),
+            scale=(1.0,) * (len(FLOW_FEATURES) + len(WINDOW_FEATURES)),
+        )
+        sidecars = build_window_sidecars([csv_path], config)
+        return csv_path, config, contract, sidecars
+
+    def test_rejects_a_sidecar_shorter_than_its_capture(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path, config, contract, sidecars = self._prepare(root)
+            truncated = pd.read_parquet(sidecars[csv_path]).iloc[:-5]
+            truncated.to_parquet(sidecars[csv_path], index=False)
+
+            with self.assertRaisesRegex(ValueError, "stale"):
+                list(iter_prepared_chunks([csv_path], contract, config, sidecars))
+
+    def test_rejects_a_sidecar_longer_than_its_capture(self):
+        """A long sidecar shifts every row without tripping a per-slice check."""
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path, config, contract, sidecars = self._prepare(root)
+            block = pd.read_parquet(sidecars[csv_path])
+            pd.concat([block.iloc[:1], block], ignore_index=True).to_parquet(
+                sidecars[csv_path], index=False
+            )
+
+            with self.assertRaisesRegex(ValueError, "stale"):
+                list(iter_prepared_chunks([csv_path], contract, config, sidecars))
 
 
 if __name__ == "__main__":

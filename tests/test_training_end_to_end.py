@@ -167,11 +167,18 @@ class TrainDetectorTests(unittest.TestCase):
         self.assertEqual(len(detections), len(flows))
         self.assertTrue(set(detections["prediction"]) <= set(detector.classes) | {"Unknown anomaly"})
 
-    def test_refuses_to_export_a_bundle_whose_alert_budget_is_unreachable(self):
-        from evaluation import BudgetUnreachableError
+    def test_a_strict_alert_budget_is_honoured_by_the_exported_threshold(self):
+        """The budget is a constraint on the bundle, not a suggestion.
 
-        with self.assertRaises(BudgetUnreachableError):
-            self._train(max_false_positives_per_hour=1e-9)
+        Refusal when a budget can only be met by flagging nothing is covered
+        deterministically in tests.test_evaluation; here the corpus separates
+        well, so a strict budget should be met rather than refused.
+        """
+
+        self._train(max_false_positives_per_hour=1e-6)
+        policy = self._manifest()["thresholds"]["policy"]
+
+        self.assertLessEqual(policy["realized_false_positives_per_hour"], 1e-6)
 
 
 class WindowSupportTests(unittest.TestCase):

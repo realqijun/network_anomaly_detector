@@ -15,6 +15,29 @@ from explain import (
 FEATURES = ("Flow Duration", "Tot Fwd Pkts", "win1s_dst_unique_src")
 
 
+def _network_with_decoder(input_dim=3, num_classes=2, decoder_gain=0.5):
+    """A network whose decoder actually reconstructs something.
+
+    With an all-zero decoder the reconstruction is identically zero, so
+    `features - reconstruction` equals `features` and no test can tell the
+    difference between attributing reconstruction error and attributing the
+    raw input.
+    """
+
+    model = _zeroed_network(input_dim, num_classes)
+    with torch.no_grad():
+        model.encoder[1].weight.fill_(1.0)
+        for index in range(min(input_dim, 4)):
+            model.encoder[0].weight[index, index] = 1.0
+        model.encoder[4].weight.copy_(
+            torch.eye(2, 4) if input_dim >= 2 else torch.zeros(2, 4)
+        )
+        model.decoder[0].weight.copy_(torch.eye(4, 2))
+        model.decoder[2].weight.copy_(torch.eye(input_dim, 4) * decoder_gain)
+    model.eval()
+    return model
+
+
 def _zeroed_network(input_dim=3, num_classes=2):
     model = HybridDetectorNetwork(
         input_dim=input_dim, num_classes=num_classes, hidden_dims=(4,), latent_dim=2, dropout=0.0
@@ -107,11 +130,26 @@ class ClassGradientBasisTests(unittest.TestCase):
 class ReconstructionBasisTests(unittest.TestCase):
     """An unknown anomaly has no logit, so attribute against the score itself."""
 
-    def test_contributions_reconstruct_the_reported_anomaly_score(self):
-        """The score is the mean of these terms, so this is exactly faithful."""
+    def test_contributions_reconstruct_the_score_the_detector_reports(self):
+        """Compared against the runtime's own score, not against itself.
 
-        model = _zeroed_network()
-        prepared = np.array([[3.0, 4.0, 0.0]], dtype=np.float32)
+        The decoder is non-trivial here on purpose: with an all-zero decoder
+        the reconstruction is zero and this assertion cannot distinguish
+        `features - reconstruction` from `features`.
+        """
+
+        model = _network_with_decoder()
+        prepared = np.array([[3.0, 4.0, 1.0]], dtype=np.float32)
+
+        with torch.inference_mode():
+            batch = torch.from_numpy(prepared)
+            _, reconstruction = model(batch)
+            detector_score = float(
+                torch.mean((batch - reconstruction) ** 2, dim=1)[0]
+            )
+        self.assertGreater(detector_score, 0.0)
+        # The decoder must actually change the input, or the test is vacuous.
+        self.assertFalse(np.allclose(reconstruction.numpy(), 0.0))
 
         explanations = explain_rows(
             model,
@@ -123,9 +161,35 @@ class ReconstructionBasisTests(unittest.TestCase):
         )
 
         total = sum(item["contribution"] for item in explanations[0])
-        expected_score = float(np.mean(prepared[0] ** 2))
 
-        self.assertAlmostEqual(total, expected_score * len(FEATURES), places=4)
+        self.assertAlmostEqual(total, detector_score * len(FEATURES), places=4)
+
+    def test_attributes_reconstruction_error_not_the_raw_input(self):
+        """A feature the decoder rebuilds perfectly contributes nothing."""
+
+        model = _network_with_decoder()
+        prepared = np.array([[6.0, 0.0, 0.0]], dtype=np.float32)
+
+        with torch.inference_mode():
+            batch = torch.from_numpy(prepared)
+            _, reconstruction = model(batch)
+        residual = (batch - reconstruction).numpy()[0]
+
+        explanations = explain_rows(
+            model,
+            prepared,
+            FEATURES,
+            class_indices=np.array([0]),
+            use_reconstruction=np.array([True]),
+            top_k=len(FEATURES),
+        )
+        by_feature = {item["feature"]: item["contribution"] for item in explanations[0]}
+
+        for index, name in enumerate(FEATURES):
+            with self.subTest(feature=name):
+                self.assertAlmostEqual(
+                    by_feature[name], float(residual[index] ** 2), places=4
+                )
 
     def test_ranks_the_feature_furthest_from_the_benign_expectation(self):
         model = _zeroed_network()

@@ -115,6 +115,21 @@ class GroupedSplitTests(unittest.TestCase):
         self.assertEqual([p.name for p in split.train], ["day-20.csv", "day-22.csv"])
         self.assertEqual([p.name for p in split.validation], ["day-21.csv"])
 
+    def test_matches_a_filename_even_when_the_group_key_does_not(self):
+        """The filename arm: the pattern appears only in the shard suffix."""
+
+        paths = [
+            Path("data/02-14-2018_TrafficForML.csv"),
+            Path("data/02-15-2018_WebAttacks.csv"),
+        ]
+
+        split = build_grouped_split(paths, validation_patterns=("WebAttacks",))
+
+        self.assertEqual([p.name for p in split.validation], ["02-15-2018_WebAttacks.csv"])
+        self.assertEqual([p.name for p in split.train], ["02-14-2018_TrafficForML.csv"])
+        # And the group key itself carries no trace of the pattern.
+        self.assertEqual(split.validation_groups, ["2018-02-15"])
+
     def test_reports_the_available_group_keys_when_nothing_matches(self):
         with self.assertRaises(ValueError) as caught:
             build_grouped_split(MIRROR, validation_patterns=("16-02-2018",))

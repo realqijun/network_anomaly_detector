@@ -26,6 +26,8 @@ def write_bundle(
     with_window_block: bool = False,
     anomaly_threshold: float = 0.1,
     disabled_reason: str | None = None,
+    decoder_gain: float = 0.0,
+    classifier_gain: float = 0.0,
 ) -> dict:
     """Write a zero-weight bundle whose behaviour is fully predictable."""
 
@@ -41,6 +43,27 @@ def write_bundle(
     )
     for parameter in model.parameters():
         parameter.data.zero_()
+    if decoder_gain:
+        # An all-zero decoder reconstructs zero, which makes every per-feature
+        # attribution equal to the raw input and any ranking assertion vacuous.
+        with torch.no_grad():
+            model.encoder[1].weight.fill_(1.0)
+            model.decoder[2].weight.copy_(
+                torch.eye(len(features), 4) * float(decoder_gain)
+            )
+    if classifier_gain:
+        # With an all-zero classifier every softmax is uniform, so no row ever
+        # clears a family threshold and the named-family path is unreachable.
+        with torch.no_grad():
+            model.encoder[1].weight.fill_(1.0)
+            model.encoder[0].weight[0, features.index("Tot Fwd Pkts")] = 1.0
+            model.encoder[0].bias.copy_(torch.tensor([0.5, -0.25, 0.75, -1.0]))
+            model.encoder[4].weight.copy_(
+                torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+            )
+            model.classifier.weight.copy_(
+                torch.tensor([[0.0, 0.0], [float(classifier_gain), 0.0]])
+            )
     torch.save(model.state_dict(), directory / "model.pt")
 
     manifest = {

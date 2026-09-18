@@ -74,9 +74,16 @@ def recall_at_false_positive_budget(
 ) -> tuple[float, float]:
     """The recall still available once the alert budget is enforced.
 
-    Candidates are the observed benign scores, with no sentinel above the
-    maximum: the highest real candidate still flags at least one benign row, so
-    an unmeetable budget is genuinely unmeetable and says so.
+    Candidates are the observed benign scores plus one just above the highest
+    of them. That last candidate flags no benign row at all, so a budget is
+    always technically meetable and this function always returns a threshold.
+    Without it a perfectly separating detector is rejected: if every benign row
+    ties at one score, the highest real candidate still flags all of them, and
+    a budget that a slightly higher threshold would meet with zero false
+    positives looks unreachable.
+
+    Whether the resulting recall is worth shipping is a policy question, and it
+    belongs to select_anomaly_threshold rather than to this measurement.
     """
 
     truth = np.asarray(truth)
@@ -86,13 +93,11 @@ def recall_at_false_positive_budget(
     if not benign_scores.size:
         raise ValueError("Cannot budget false positives without benign rows")
 
-    candidates = np.unique(benign_scores)
-    best_rate = None
+    observed = np.unique(benign_scores)
+    candidates = np.append(observed, np.nextafter(observed[-1], np.inf))
     for threshold in candidates:
         flagged = scores >= threshold
         rate = false_positives_per_hour(truth, flagged, benign_hours, sampling_rate)
-        if best_rate is None or rate < best_rate:
-            best_rate = rate
         if rate <= budget_per_hour:
             recall = (
                 float(np.count_nonzero(flagged & positives) / np.count_nonzero(positives))
@@ -101,10 +106,11 @@ def recall_at_false_positive_budget(
             )
             return recall, float(threshold)
 
+    # The final candidate flags nothing, so this is unreachable in practice.
     raise BudgetUnreachableError(
-        f"No threshold meets {budget_per_hour} false positives per hour; the "
-        f"best achievable rate is {best_rate}. Raise the budget or improve the "
-        "benign separation before exporting a bundle."
+        f"No threshold meets {budget_per_hour} false positives per hour, not "
+        "even one above every benign score. This should be impossible; the "
+        "inputs are probably not what this function expects."
     )
 
 
@@ -195,9 +201,19 @@ def select_anomaly_threshold(
     if policy == FALSE_POSITIVE_BUDGET:
         if budget_per_hour is None:
             raise ValueError("budget_per_hour is required for the budget policy")
-        _, threshold = recall_at_false_positive_budget(
+        recall, threshold = recall_at_false_positive_budget(
             truth, scores, budget_per_hour, benign_hours, sampling_rate
         )
+        # A budget that can only be met by flagging nothing is met, and
+        # useless. Refusing here is deliberate: shipping a bundle that detects
+        # nothing within its own alert budget is worse than shipping none.
+        if recall <= 0.0 and np.any(truth != 0):
+            raise BudgetUnreachableError(
+                f"A budget of {budget_per_hour} false positives per hour can "
+                "only be met by flagging nothing: no threshold catches a single "
+                "attack row within it. Raise the budget or improve the benign "
+                "separation before exporting a bundle."
+            )
         realized = false_positives_per_hour(
             truth, scores >= threshold, benign_hours, sampling_rate
         )

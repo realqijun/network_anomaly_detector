@@ -239,7 +239,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
 
     keys = [FlowKey.parse(text) for text in arguments.flow] if arguments.flow else None
-    evidence = collect_evidence(arguments.pcap, keys, arguments.max_packets)
+    try:
+        evidence = collect_evidence(arguments.pcap, keys, arguments.max_packets)
+    except FileNotFoundError:
+        print(f"No such capture: {arguments.pcap}", file=sys.stderr)
+        return 2
+    except Exception as error:
+        # scapy raises its own exception types for a corrupt or truncated
+        # capture. A traceback is not a useful answer to "read this file".
+        print(f"Could not read {arguments.pcap}: {error}", file=sys.stderr)
+        return 2
+
     json.dump([value.to_dict() for value in evidence.values()], sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0

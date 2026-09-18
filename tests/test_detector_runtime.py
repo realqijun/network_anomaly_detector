@@ -104,6 +104,56 @@ class DetectTests(unittest.TestCase):
             self.assertTrue(result["explanation"].iloc[1])
             self.assertIn("feature", result["explanation"].iloc[1][0])
 
+    def test_the_explanation_ranks_the_feature_that_actually_drove_the_score(self):
+        """A discriminating model, or the ranking assertion means nothing."""
+
+        with TemporaryDirectory() as temporary:
+            detector = self._detector(Path(temporary), decoder_gain=0.5)
+            flows = pd.DataFrame(
+                {"Flow Duration": [0.0, 0.0], "Tot Fwd Pkts": [0.0, 400.0]}
+            )
+
+            result = detector.detect(flows, explain=True)
+            flagged = result["explanation"].iloc[1]
+
+            self.assertEqual(flagged[0]["feature"], "Tot Fwd Pkts")
+            self.assertGreater(
+                abs(flagged[0]["contribution"]), abs(flagged[-1]["contribution"])
+            )
+
+    def test_a_named_family_row_is_attributed_against_its_class_logit(self):
+        """Covers the class-basis path, which an all-zero classifier hides."""
+
+        with TemporaryDirectory() as temporary:
+            detector = self._detector(
+                Path(temporary), classifier_gain=40.0, anomaly_threshold=1e9
+            )
+            flows = pd.DataFrame(
+                {"Flow Duration": [0.0], "Tot Fwd Pkts": [50.0]}
+            )
+
+            result = detector.detect(flows, explain=True, explain_top_k=2)
+
+            self.assertEqual(result["prediction"].iloc[0], "DDoS")
+            explanation = result["explanation"].iloc[0]
+            self.assertEqual(explanation[0]["basis"], "gradient_x_input")
+            self.assertEqual(explanation[0]["feature"], "Tot Fwd Pkts")
+            self.assertNotAlmostEqual(explanation[0]["contribution"], 0.0)
+
+    def test_explanation_contributions_account_for_the_reported_score(self):
+        with TemporaryDirectory() as temporary:
+            detector = self._detector(Path(temporary), decoder_gain=0.5)
+            flows = pd.DataFrame(
+                {"Flow Duration": [0.0], "Tot Fwd Pkts": [400.0]}
+            )
+
+            result = detector.detect(flows, explain=True, explain_top_k=2)
+            total = sum(item["contribution"] for item in result["explanation"].iloc[0])
+
+            self.assertAlmostEqual(
+                total, float(result["anomaly_score"].iloc[0]) * 2, places=4
+            )
+
     def test_explanations_are_absent_unless_requested(self):
         with TemporaryDirectory() as temporary:
             detector = self._detector(Path(temporary))

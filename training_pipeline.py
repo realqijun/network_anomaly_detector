@@ -275,6 +275,15 @@ def _read_chunks(
             offset += len(chunk)
             yield path, chunk
 
+        if sidecar is not None and len(sidecar) != offset:
+            # A sidecar longer than its capture shifts every row's window
+            # values without tripping the per-slice guard above, which only
+            # sees a short final slice.
+            raise ValueError(
+                f"Window sidecar for {path} has {len(sidecar)} rows but the "
+                f"capture has {offset}; the cache is stale, rebuild it"
+            )
+
 
 def _clean_chunk(
     chunk: pd.DataFrame, feature_columns: Sequence[str]

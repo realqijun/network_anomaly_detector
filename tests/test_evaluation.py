@@ -79,31 +79,71 @@ class RecallAtFalsePositiveBudgetTests(unittest.TestCase):
         self.assertAlmostEqual(threshold, 0.3)
         self.assertAlmostEqual(recall, 0.5)
 
-    def test_raises_when_no_threshold_can_meet_the_budget(self):
-        with self.assertRaises(BudgetUnreachableError) as caught:
-            recall_at_false_positive_budget(
-                self.truth, self.scores, budget_per_hour=0.5, benign_hours=1.0
-            )
+    def test_a_tight_budget_falls_back_to_flagging_nothing(self):
+        """Always returns a threshold; whether it is useful is a policy call."""
 
-        # The message has to say what is achievable, or it is not actionable.
-        self.assertIn("1.0", str(caught.exception))
+        # Attacks sit below the noisiest benign row, so buying zero false
+        # positives costs every detection.
+        truth = np.array([0, 0, 0, 1, 1])
+        scores = np.array([0.1, 0.2, 0.9, 0.3, 0.4])
+
+        recall, threshold = recall_at_false_positive_budget(
+            truth, scores, budget_per_hour=0.5, benign_hours=1.0
+        )
+
+        self.assertEqual(recall, 0.0)
+        self.assertGreater(threshold, scores.max())
+
+    def test_a_tight_budget_still_keeps_detections_it_can_afford(self):
+        """The shared fixture buys zero false positives without losing recall."""
+
+        recall, threshold = recall_at_false_positive_budget(
+            self.truth, self.scores, budget_per_hour=0.5, benign_hours=1.0
+        )
+
+        self.assertAlmostEqual(recall, 0.5)
+        self.assertGreater(threshold, 0.3)
+
+    def test_a_perfectly_separating_detector_is_not_rejected(self):
+        """Every benign row tied at one score used to look unreachable."""
+
+        truth = np.array([0] * 100 + [1] * 10)
+        scores = np.array([0.5] * 100 + [0.9] * 10)
+
+        recall, threshold = recall_at_false_positive_budget(
+            truth, scores, budget_per_hour=10.0, benign_hours=1.0
+        )
+
+        self.assertAlmostEqual(recall, 1.0)
+        self.assertGreater(threshold, 0.5)
+        self.assertLessEqual(threshold, 0.9)
 
 
 
 class TopKTests(unittest.TestCase):
     def test_measures_precision_over_the_highest_scoring_rows(self):
-        truth = np.array([1, 0, 1, 0])
+        """Asymmetric on purpose: a symmetric fixture cannot catch an inversion."""
+
+        truth = np.array([1, 1, 0, 0])
         scores = np.array([0.9, 0.8, 0.7, 0.6])
 
         precision, effective_k = top_k_precision(truth, scores, k=2)
 
-        self.assertAlmostEqual(precision, 0.5)
+        self.assertAlmostEqual(precision, 1.0)
         self.assertAlmostEqual(effective_k, 2.0)
+
+    def test_scores_the_top_of_the_queue_not_the_bottom(self):
+        truth = np.array([0, 0, 1, 1])
+        scores = np.array([0.9, 0.8, 0.7, 0.6])
+
+        precision, _ = top_k_precision(truth, scores, k=2)
+
+        self.assertAlmostEqual(precision, 0.0)
 
     def test_reports_the_effective_population_k_under_sampling(self):
         """Top 10 of a quarter sample is roughly the top 40 of the population."""
 
-        truth = np.array([1, 0, 1, 0])
+        truth = np.array([1, 1, 0, 0])
         scores = np.array([0.9, 0.8, 0.7, 0.6])
 
         _, effective_k = top_k_precision(truth, scores, k=2, sampling_rate=0.25)
@@ -161,17 +201,50 @@ class ThresholdPolicyTests(unittest.TestCase):
         self.assertEqual(policy.policy, "benign_quantile")
         self.assertAlmostEqual(policy.parameter, 0.95)
 
-    def test_refuses_to_produce_a_threshold_it_cannot_justify(self):
-        """Better no bundle than one whose threshold is whatever a loop left."""
+    def test_refuses_a_budget_that_can_only_be_met_by_flagging_nothing(self):
+        """Better no bundle than one that detects nothing within its budget."""
 
-        with self.assertRaises(BudgetUnreachableError):
+        truth = np.array([0, 0, 0, 1, 1])
+        scores = np.array([0.1, 0.2, 0.9, 0.3, 0.4])
+
+        with self.assertRaisesRegex(BudgetUnreachableError, "flagging nothing"):
             select_anomaly_threshold(
                 "false_positive_budget",
-                truth=self.truth,
-                scores=self.scores,
+                truth=truth,
+                scores=scores,
                 benign_hours=1.0,
                 budget_per_hour=0.5,
             )
+
+    def test_accepts_a_perfectly_separating_detector(self):
+        truth = np.array([0] * 100 + [1] * 10)
+        scores = np.array([0.5] * 100 + [0.9] * 10)
+
+        policy = select_anomaly_threshold(
+            "false_positive_budget",
+            truth=truth,
+            scores=scores,
+            benign_hours=1.0,
+            budget_per_hour=10.0,
+        )
+
+        self.assertEqual(policy.realized_false_positives_per_hour, 0.0)
+
+    def test_the_quantile_policy_uses_the_quantile_it_was_given(self):
+        """Asserting the echoed parameter alone would not catch a wrong cut."""
+
+        truth = np.array([0, 0, 0, 0, 1])
+        scores = np.array([0.0, 1.0, 2.0, 3.0, 9.0])
+
+        median = select_anomaly_threshold(
+            "benign_quantile", truth=truth, scores=scores, benign_hours=1.0, quantile=0.5
+        )
+        high = select_anomaly_threshold(
+            "benign_quantile", truth=truth, scores=scores, benign_hours=1.0, quantile=0.99
+        )
+
+        self.assertAlmostEqual(median.threshold, 1.5)
+        self.assertAlmostEqual(high.threshold, 2.97)
 
     def test_rejects_an_unknown_policy_by_name(self):
         with self.assertRaisesRegex(ValueError, "roc_optimal"):
