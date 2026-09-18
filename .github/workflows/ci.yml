@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Two steps on purpose. The PyTorch CPU index does not serve Flask,
+      # pandas, scapy or scikit-learn, so a single --index-url install fails,
+      # and --extra-index-url would usually still pull the ~800 MB PyPI wheel.
+      - name: Install CPU-only torch
+        run: pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Byte-compile
+        run: python -m compileall -q . -x '(legacy|\.git|\.venv|\.agents|\.claude)'
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -t . -v

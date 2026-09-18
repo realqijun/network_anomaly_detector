@@ -7,16 +7,20 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY deploy/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY deploy/ ./
+COPY detector_runtime.py ./detector_runtime.py
+# The runtime imports these, so the image breaks on start without them.
+COPY feature_contract.py ./feature_contract.py
+COPY explain.py ./explain.py
+RUN test -f model_bundle/manifest.json && test -f model_bundle/model.pt
 
-RUN mkdir -p /app/working
-COPY working/anomaly_detector_model.pth /app/working/
-COPY working/min_max_scaler.pkl /app/working/
-COPY working/optimal_threshold.npy /app/working/
+ENV MODEL_BUNDLE_DIR=/app/model_bundle
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8000", "--capture-output", "--log-level", "info", "app:app"]
+# --timeout raised above gunicorn's 30s default: scoring is linear in row
+# count, and the default killed the sole worker mid-request on large uploads.
+CMD ["gunicorn", "-w", "1", "--timeout", "120", "-b", "0.0.0.0:8000", "--capture-output", "--log-level", "info", "app:app"]

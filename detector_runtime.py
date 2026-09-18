@@ -1,4 +1,10 @@
-"""Lightweight runtime for model bundles produced by training_pipeline.py."""
+"""Lightweight runtime for model bundles produced by training_pipeline.py.
+
+The feature schema, the transform and the version rules live in
+feature_contract.py, which training imports too. This module loads a bundle,
+runs it, and turns scores into predictions; it does not define what a feature
+is or how it is scaled.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +17,12 @@ import pandas as pd
 import torch
 from torch import nn
 
-
-BUNDLE_FORMAT_VERSION = 1
+from explain import DEFAULT_TOP_K, explain_rows
+from feature_contract import (
+    BUNDLE_FORMAT_VERSION,
+    FeatureContract,
+    check_bundle_version,
+)
 
 
 class HybridDetectorNetwork(nn.Module):
@@ -60,10 +70,6 @@ class HybridDetectorNetwork(nn.Module):
         return self.classifier(latent), self.decoder(latent)
 
 
-def _signed_log1p(values: np.ndarray) -> np.ndarray:
-    return np.sign(values) * np.log1p(np.abs(values))
-
-
 class Detector:
     """Load one immutable bundle and score flow rows through a small interface."""
 
@@ -78,26 +84,9 @@ class Detector:
             )
 
         self.manifest: dict[str, Any] = json.loads(manifest_path.read_text())
-        version = self.manifest.get("bundle_format_version")
-        if version != BUNDLE_FORMAT_VERSION:
-            raise ValueError(
-                f"Unsupported bundle format {version!r}; "
-                f"runtime expects {BUNDLE_FORMAT_VERSION}"
-            )
-
-        contract = self.manifest["feature_contract"]
-        if contract.get("transform") != "signed_log1p_standardize":
-            raise ValueError(f"Unsupported feature transform: {contract.get('transform')}")
-
-        self.feature_names = tuple(contract["features"])
-        self.mean = np.asarray(contract["mean"], dtype=np.float32)
-        self.scale = np.asarray(contract["scale"], dtype=np.float32)
-        if len(self.feature_names) != len(self.mean) or len(self.mean) != len(self.scale):
-            raise ValueError("Feature names, means, and scales have different lengths")
-        if not np.all(np.isfinite(self.mean)) or not np.all(np.isfinite(self.scale)):
-            raise ValueError("Feature contract contains non-finite scaling values")
-        if np.any(self.scale <= 0):
-            raise ValueError("Feature contract scale values must be positive")
+        check_bundle_version(self.manifest.get("bundle_format_version"))
+        self.contract = FeatureContract.from_manifest(self.manifest["feature_contract"])
+        self.feature_names = self.contract.feature_names
 
         self.classes = tuple(self.manifest["taxonomy"]["classes"])
         model_config = self.manifest["model"]
@@ -123,37 +112,37 @@ class Detector:
         }
         self.coverage = self.manifest["taxonomy"].get("reportable", {})
 
-    def _prepare(self, flows: pd.DataFrame) -> np.ndarray:
-        missing = [name for name in self.feature_names if name not in flows.columns]
-        if missing:
-            preview = ", ".join(missing[:8])
-            suffix = "..." if len(missing) > 8 else ""
-            raise ValueError(f"Input is missing required features: {preview}{suffix}")
+    @property
+    def has_window_coverage(self) -> bool:
+        """Whether this bundle was trained with temporal window features.
 
-        numeric = flows.loc[:, self.feature_names].apply(pd.to_numeric, errors="coerce")
-        values = numeric.to_numpy(dtype=np.float32, copy=True)
-        invalid = ~np.isfinite(values)
-        if invalid.any():
-            bad_columns = np.asarray(self.feature_names)[np.unique(np.where(invalid)[1])]
-            preview = ", ".join(bad_columns[:8])
-            raise ValueError(f"Input contains missing or non-finite values in: {preview}")
+        A bundle without them cannot see rate-driven behaviour, and CONTEXT.md
+        requires that missing coverage be visible rather than assumed.
+        """
 
-        transformed = _signed_log1p(values)
-        return ((transformed - self.mean) / self.scale).astype(np.float32, copy=False)
+        return bool(self.contract.window_features)
+
+    @property
+    def window_coverage_reason(self) -> str | None:
+        return self.contract.window_features_disabled_reason
 
     def detect(
         self,
         flows: pd.DataFrame,
         batch_size: int = 8192,
         include_probabilities: bool = False,
+        explain: bool = False,
+        explain_top_k: int = DEFAULT_TOP_K,
     ) -> pd.DataFrame:
         """Return one evidence-friendly detection row per input flow."""
 
         if flows.empty:
             columns = ["prediction", "confidence", "anomaly_score", "is_anomaly"]
+            if explain:
+                columns.append("explanation")
             return pd.DataFrame(columns=columns, index=flows.index)
 
-        prepared = self._prepare(flows)
+        prepared = self.contract.prepare(flows)
         probabilities: list[np.ndarray] = []
         anomaly_scores: list[np.ndarray] = []
 
@@ -197,7 +186,47 @@ class Detector:
         if include_probabilities:
             for index, label in enumerate(self.classes):
                 result[f"probability_{label}"] = probability_matrix[:, index]
+        if explain:
+            result["explanation"] = self._explain(
+                prepared, predictions, best_indices, explain_top_k
+            )
         return result
+
+    def _explain(
+        self,
+        prepared: np.ndarray,
+        predictions: list[str],
+        class_indices: np.ndarray,
+        top_k: int,
+    ) -> list[list[dict[str, Any]]]:
+        """Attribute the flagged rows only.
+
+        This is a separate pass rather than part of the scoring loop above:
+        scoring runs under torch.inference_mode, and a tensor produced there
+        cannot have requires_grad set afterwards. Restricting it to flagged
+        rows is also what keeps the cost proportional to what was reported.
+        """
+
+        flagged = np.flatnonzero(np.asarray(predictions) != "Benign")
+        explanations: list[list[dict[str, Any]]] = [[] for _ in predictions]
+        if not flagged.size:
+            return explanations
+
+        unknown = np.asarray(
+            [predictions[row] == "Unknown anomaly" for row in flagged], dtype=bool
+        )
+        produced = explain_rows(
+            self.model,
+            prepared[flagged],
+            self.feature_names,
+            class_indices=class_indices[flagged],
+            use_reconstruction=unknown,
+            top_k=top_k,
+            device=self.device,
+        )
+        for row, explanation in zip(flagged, produced):
+            explanations[row] = explanation
+        return explanations
 
 
 def run_detector(
@@ -207,6 +236,7 @@ def run_detector(
     batch_size: int = 8192,
     device: str | None = None,
     include_probabilities: bool = False,
+    explain: bool = False,
 ) -> pd.DataFrame:
     """Convenience function for one-off local flow detection."""
 
@@ -215,7 +245,13 @@ def run_detector(
         flows,
         batch_size=batch_size,
         include_probabilities=include_probabilities,
+        explain=explain,
     )
 
 
-__all__ = ["Detector", "HybridDetectorNetwork", "run_detector"]
+__all__ = [
+    "BUNDLE_FORMAT_VERSION",
+    "Detector",
+    "HybridDetectorNetwork",
+    "run_detector",
+]

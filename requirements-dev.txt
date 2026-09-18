@@ -1,0 +1,15 @@
+# Development and CI dependencies: everything needed to run `tests/`.
+#
+# Install the CPU-only torch wheel first when bandwidth or disk matters, then
+# this file. The PyTorch CPU index does not serve Flask, pandas or scapy, so a
+# single --index-url install cannot satisfy both:
+#
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# tests/test_deploy_app.py imports deploy/app.py, which imports Flask.
+Flask==3.1.1
+# tests/test_evidence.py and evidence.py read PCAP files with scapy.
+scapy==2.6.1
