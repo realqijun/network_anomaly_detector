@@ -16,6 +16,12 @@ from pcap_parser import parse_pcap_to_dataframe, probe_pcap_runtime
 
 DEFAULT_BUNDLE_DIR = "model_bundle"
 
+# An upload the single worker can finish inside gunicorn's request timeout.
+DEFAULT_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+# The results page renders one row per flow, so an uncapped table turns a few
+# megabytes of CSV into hundreds of megabytes of HTML.
+DEFAULT_MAX_RENDERED_ROWS = 1000
+
 
 def _resolve_bundle_dir(bundle_dir: str | os.PathLike) -> str:
     bundle_path = os.fspath(bundle_dir)
@@ -36,8 +42,18 @@ def create_app(
     """
 
     app = Flask(__name__)
-    app.config['SECRET_KEY'] = os.urandom(24).hex()
-    app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+    # A per-process random key silently invalidates every other worker's
+    # session cookies, so more than one gunicorn worker loses flash state.
+    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(24).hex()
+    # Scoring and rendering are both linear in row count, and a 100 MiB CSV is
+    # roughly 7.5M rows: enough to exhaust memory and kill the worker before it
+    # answers. This cap is what the worker can actually finish.
+    app.config['MAX_CONTENT_LENGTH'] = int(
+        os.environ.get('MAX_UPLOAD_BYTES', DEFAULT_MAX_UPLOAD_BYTES)
+    )
+    app.config['MAX_RENDERED_ROWS'] = int(
+        os.environ.get('MAX_RENDERED_ROWS', DEFAULT_MAX_RENDERED_ROWS)
+    )
     resolved_bundle_dir = _resolve_bundle_dir(bundle_dir)
     app.config['MODEL_BUNDLE_DIR'] = resolved_bundle_dir
     if enable_pcap_uploads is None:
@@ -66,7 +82,11 @@ def create_app(
             f"The configured model bundle is not compatible with this runtime. {error}"
         )
     except Exception as error:
-        app.logger.error("Failed to load model bundle from %s: %s", resolved_bundle_dir, error)
+        # exception() keeps the traceback: without it a genuine code bug and a
+        # malformed manifest produce the same one-line log.
+        app.logger.exception(
+            "Failed to load model bundle from %s: %s", resolved_bundle_dir, error
+        )
         app.config['DETECTOR'] = None
         app.config['BUNDLE_ERROR'] = None
 
@@ -117,8 +137,11 @@ def create_app(
         coverage_notes: list[str] = []
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
-                file.save(tmp_file.name)
+                # Bind the path before the write. Assigning after save() meant a
+                # failed write left tmp_path None, so the finally block below
+                # skipped cleanup and the file leaked.
                 tmp_path = tmp_file.name
+                file.save(tmp_path)
 
             if file_extension == 'csv':
                 flows = pd.read_csv(tmp_path)
@@ -147,16 +170,36 @@ def create_app(
                     coverage_notes.append(span_note)
 
             detections = detector.detect(flows, explain=True)
+        # UnicodeDecodeError subclasses ValueError, so it has to be caught
+        # first or the generic clause below swallows it and shows a codec
+        # message to someone who just picked the wrong file.
+        except UnicodeDecodeError:
+            flash(
+                "That file is not readable as CSV text. Upload a flow CSV, or "
+                "enable PCAP uploads to submit a capture.",
+                "danger",
+            )
+            return redirect(url_for('index'))
         except ValueError as error:
             flash(f"Could not score uploaded file: {error}", "danger")
             return redirect(url_for('index'))
-        except (FileNotFoundError, KeyError, RuntimeError) as error:
+        except (FileNotFoundError, KeyError, RuntimeError, OSError) as error:
             flash(f"Error processing file: {error}", "danger")
             return redirect(url_for('index'))
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+        total_samples = int(len(detections))
+        total_anomalies = int(detections['is_anomaly'].sum()) if total_samples else 0
+        anomaly_frequency = (total_anomalies / total_samples * 100) if total_samples else 0.0
+
+        # Every flow is scored and counted, but only a bounded slice is turned
+        # into rows and rendered. One <tr> per flow makes the response grow
+        # with the upload, so an uncapped table is how a legal upload becomes
+        # hundreds of megabytes of HTML.
+        limit = app.config['MAX_RENDERED_ROWS']
+        shown = detections.head(limit) if total_samples > limit else detections
         results = [
             {
                 'index': position + 1,
@@ -168,16 +211,8 @@ def create_app(
                 'is_anomaly': row.is_anomaly,
                 'explanation': getattr(row, 'explanation', []) or [],
             }
-            for position, row in enumerate(detections.itertuples())
+            for position, row in enumerate(shown.itertuples())
         ]
-        total_samples = len(results)
-        total_anomalies = sum(1 for row in results if row['is_anomaly'])
-        anomaly_frequency = (total_anomalies / total_samples * 100) if total_samples else 0.0
-        flash(
-            f"Processed {total_samples} samples. Found {total_anomalies} "
-            f"({anomaly_frequency:.2f}%) anomalies",
-            "success",
-        )
         return render_template(
             'results.html',
             results=results,
@@ -185,6 +220,8 @@ def create_app(
             total_anomalies=total_anomalies,
             anomaly_frequency=f"{anomaly_frequency:.2f}",
             coverage_notes=coverage_notes,
+            rendered_rows=len(results),
+            truncated=total_samples > len(results),
         )
 
     return app

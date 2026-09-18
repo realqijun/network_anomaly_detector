@@ -670,6 +670,21 @@ class FeatureContract:
             suffix = "..." if len(missing) > 8 else ""
             raise ValueError(f"Input is missing required features: {preview}{suffix}")
 
+        # Alias folding can map two source spellings onto one contract name.
+        # Selecting that name then yields a 2-D block, and the failure surfaces
+        # as an unreadable numpy broadcast error several frames later.
+        counts = flows.columns.value_counts()
+        duplicated = [
+            name for name in self.feature_names if int(counts.get(name, 0)) > 1
+        ]
+        if duplicated:
+            preview = ", ".join(duplicated[:8])
+            raise ValueError(
+                f"Input maps more than one column onto the same contract "
+                f"feature: {preview}. Remove the duplicate spelling, for "
+                "example a column present as both its long and short name."
+            )
+
         numeric = flows.loc[:, list(self.feature_names)].apply(
             pd.to_numeric, errors="coerce"
         )

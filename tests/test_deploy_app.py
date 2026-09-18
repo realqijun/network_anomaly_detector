@@ -233,5 +233,178 @@ class DeployAppFailClosedTests(unittest.TestCase):
             self.assertNotIn("no valid network flows were extracted", body.lower())
 
 
+class UploadGuardTests(unittest.TestCase):
+    """The limits that stand between an upload and the worker.
+
+    Each of these was a surviving mutant: the guard could be deleted outright
+    and the whole suite still passed.
+    """
+
+    def test_rejects_an_unsupported_extension(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            response = client.post(
+                "/predict",
+                data={"file": (io.BytesIO(b"Flow Duration,Tot Fwd Pkts\n1.0,1.0\n"), "flows.txt")},
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+
+            body = response.get_data(as_text=True)
+            self.assertIn("Unsupported file type", body)
+            self.assertNotIn("Flows scored", body)
+
+    def test_rejects_an_executable_masquerading_by_extension(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            response = client.post(
+                "/predict",
+                data={"file": (io.BytesIO(b"\x7fELF\x02\x01\x01"), "payload.elf")},
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+
+            self.assertIn("Unsupported file type", response.get_data(as_text=True))
+
+    def test_a_binary_csv_is_refused_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            response = _post_csv(client, b"\xff\xfe\x00\x01\x02\x03")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("not readable as CSV text", response.get_data(as_text=True))
+
+    def test_declares_an_upload_cap_the_worker_can_finish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            app = create_app(bundle)
+
+            cap = app.config["MAX_CONTENT_LENGTH"]
+
+            self.assertIsNotNone(cap)
+            self.assertLessEqual(cap, 16 * 1024 * 1024)
+
+    def test_an_upload_over_the_cap_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            app = create_app(bundle)
+            app.config["MAX_CONTENT_LENGTH"] = 512
+            client = app.test_client()
+
+            oversized = b"Flow Duration,Tot Fwd Pkts\n" + b"1.0,1.0\n" * 500
+
+            response = _post_csv(client, oversized)
+
+            self.assertEqual(response.status_code, 413)
+
+    def test_the_temporary_upload_is_always_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+            staging = Path(tempfile.gettempdir())
+            before = set(staging.glob("*.csv"))
+
+            _post_csv(client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n")
+
+            self.assertEqual(set(staging.glob("*.csv")) - before, set())
+
+    def test_a_failed_save_leaves_no_temporary_file_behind(self):
+        """The leak: tmp_path was bound after save(), so cleanup was skipped."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+            staging = Path(tempfile.gettempdir())
+            before = set(staging.glob("*.csv"))
+
+            with patch(
+                "werkzeug.datastructures.FileStorage.save",
+                side_effect=OSError("No space left on device"),
+            ):
+                response = _post_csv(client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("No space left on device", response.get_data(as_text=True))
+            self.assertEqual(set(staging.glob("*.csv")) - before, set())
+
+
+class ResultsRenderingTests(unittest.TestCase):
+    def test_counts_every_flow_but_renders_a_bounded_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            app = create_app(bundle)
+            app.config["MAX_RENDERED_ROWS"] = 5
+            client = app.test_client()
+
+            rows = b"Flow Duration,Tot Fwd Pkts\n" + b"9.0,9.0\n" * 40
+
+            body = _post_csv(client, rows).get_data(as_text=True)
+
+            self.assertIn("40", body)
+            self.assertIn("Showing the", body)
+            self.assertEqual(body.count("<tr>"), 5 + 1)
+
+    def test_a_small_upload_is_not_marked_truncated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            body = _post_csv(
+                client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n2.0,2.0\n"
+            ).get_data(as_text=True)
+
+            self.assertNotIn("Showing the", body)
+
+    def test_a_pending_flash_is_consumed_by_the_results_page(self):
+        """Keeps the flash block live: a message set but never rendered here
+        is what leaked the run summary onto whatever page came next."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            with client.session_transaction() as session:
+                session["_flashes"] = [("warning", "a pending notice")]
+
+            body = _post_csv(
+                client, b"Flow Duration,Tot Fwd Pkts\n0.0,0.0\n"
+            ).get_data(as_text=True)
+
+            self.assertIn("a pending notice", body)
+
+            later = client.get("/", follow_redirects=True).get_data(as_text=True)
+            self.assertNotIn("a pending notice", later)
+
+    def test_the_run_summary_does_not_leak_onto_the_next_page(self):
+        """It was flashed but never rendered, so it surfaced on a later page."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            _write_bundle(bundle)
+            client = create_app(bundle).test_client()
+
+            _post_csv(client, b"Flow Duration,Tot Fwd Pkts\n9.0,9.0\n")
+            later = client.get("/", follow_redirects=True).get_data(as_text=True)
+
+            self.assertNotIn("Flows scored", later)
+            self.assertNotIn("anomalies", later)
+
+
 if __name__ == "__main__":
     unittest.main()

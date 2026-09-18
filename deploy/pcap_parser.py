@@ -102,16 +102,12 @@ def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) ->
             "-c", f"/data/output/{output_csv_name}",
         ]
 
+        shutil.copy(pcap_path, host_pcap_path)
+
+        # Only the exec is guarded for FileNotFoundError. Wrapping the copy and
+        # the read too meant a missing capture reported a missing Docker image.
         try:
-            shutil.copy(pcap_path, host_pcap_path)
             subprocess.run(command, capture_output=True, text=True, check=True, timeout=300)
-
-            if not os.path.exists(local_csv_path) or os.path.getsize(local_csv_path) == 0:
-                return pd.DataFrame(columns=list(expected_features))
-
-            df_flows = pd.read_csv(local_csv_path)
-            df_flows.columns = df_flows.columns.str.strip()
-            return rename_cli_columns_to_contract(df_flows)
         except FileNotFoundError as error:
             raise RuntimeError(
                 "PCAP processing requires a local Docker client and the sibling "
@@ -122,6 +118,12 @@ def parse_pcap_to_dataframe(pcap_path: str, expected_features: Sequence[str]) ->
         except subprocess.CalledProcessError as error:
             details = (error.stderr or error.stdout or str(error)).strip()
             raise RuntimeError(f"PCAP processing failed while running CICFlowMeter: {details}") from error
+
+        if not os.path.exists(local_csv_path) or os.path.getsize(local_csv_path) == 0:
+            return pd.DataFrame(columns=list(expected_features))
+
+        df_flows = pd.read_csv(local_csv_path)
+        return rename_cli_columns_to_contract(df_flows)
 
 
 if __name__ == '__main__':

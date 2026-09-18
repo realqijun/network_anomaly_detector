@@ -21,4 +21,6 @@ ENV MODEL_BUNDLE_DIR=/app/model_bundle
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8000", "--capture-output", "--log-level", "info", "app:app"]
+# --timeout raised above gunicorn's 30s default: scoring is linear in row
+# count, and the default killed the sole worker mid-request on large uploads.
+CMD ["gunicorn", "-w", "1", "--timeout", "120", "-b", "0.0.0.0:8000", "--capture-output", "--log-level", "info", "app:app"]

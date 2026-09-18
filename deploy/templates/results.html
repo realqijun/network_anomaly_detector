@@ -16,6 +16,9 @@
         .summary div { min-width: 120px; }
         .summary dt { font-size: .8rem; color: var(--muted); margin: 0 0 2px; }
         .summary dd { margin: 0; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+        .flashes { list-style: none; padding: 0; margin: 0 0 16px; }
+        .flash { padding: 10px 14px; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
+        .truncated { font-size: .85rem; color: var(--muted); margin: 0 0 12px; }
         .coverage { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; }
         .coverage h2 { font-size: .95rem; margin: 0 0 6px; }
         .coverage p { margin: 0 0 6px; }
@@ -35,6 +38,16 @@
 <main>
     <h1>Detection results</h1>
 
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <ul class="flashes">
+            {% for category, message in messages %}
+            <li class="flash {{ category }}">{{ message }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+    {% endwith %}
+
     <dl class="summary">
         <div><dt>Flows scored</dt><dd>{{ total_samples }}</dd></div>
         <div><dt>Flagged</dt><dd>{{ total_anomalies }}</dd></div>
@@ -46,6 +59,13 @@
         <h2>Coverage gaps</h2>
         {% for note in coverage_notes %}<p>{{ note }}</p>{% endfor %}
     </section>
+    {% endif %}
+
+    {% if truncated %}
+    <p class="truncated">
+        All {{ total_samples }} flows were scored and counted above. Showing the
+        first {{ rendered_rows }} below.
+    </p>
     {% endif %}
 
     <table>

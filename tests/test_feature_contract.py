@@ -289,5 +289,39 @@ class EpochSecondsRangeTests(unittest.TestCase):
         self.assertLess(epoch_seconds(parsed).iloc[0], 0)
 
 
+class DuplicateAliasTests(unittest.TestCase):
+    """Two spellings of one feature must name themselves, not die in numpy."""
+
+    def _contract(self):
+        return FeatureContract(
+            flow_features=("Flow Duration", "Tot Fwd Pkts"),
+            mean=(0.0, 0.0),
+            scale=(1.0, 1.0),
+        )
+
+    def test_rejects_a_frame_carrying_both_spellings_of_one_feature(self):
+        frame = pd.DataFrame(
+            {
+                "Flow Duration": [1.0],
+                "Tot Fwd Pkts": [2.0],
+                "Total Fwd Packets": [3.0],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "Tot Fwd Pkts"):
+            self._contract().prepare(frame)
+
+    def test_the_message_says_what_to_do_about_it(self):
+        frame = pd.DataFrame(
+            {"Flow Duration": [1.0], "Tot Fwd Pkts": [2.0], "Total Fwd Packets": [3.0]}
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            self._contract().prepare(frame)
+
+        self.assertIn("more than one column", str(caught.exception))
+        self.assertNotIn("broadcast", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
