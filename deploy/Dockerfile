@@ -1,7 +1,7 @@
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
-    libpcap-dev \
+    libpcap0.8 \
     tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
@@ -12,11 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/working
-COPY working/anomaly_detector_model.pth /app/working/
-COPY working/min_max_scaler.pkl /app/working/
-COPY working/optimal_threshold.npy /app/working/
+RUN python -m unittest discover -s tests -v
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8000", "--capture-output", "--log-level", "info", "app:app"]
+CMD ["sh", "-c", "exec gunicorn -w 1 -b 0.0.0.0:${PORT:-8080} --timeout 300 --capture-output --log-level info app:app"]

@@ -11,6 +11,7 @@ import json
 import math
 import random
 import shutil
+import warnings
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -57,10 +58,10 @@ class TrainingConfig:
     output_dir: str = "artifacts/cse_cic_ids2018_bundle"
     csv_pattern: str = "**/*.csv"
     validation_patterns: tuple[str, ...] = (
-        "16-02-2018",
-        "21-02-2018",
-        "23-02-2018",
-        "01-03-2018",
+        "02-16-2018",
+        "02-21-2018",
+        "02-23-2018",
+        "03-01-2018",
     )
     chunk_size: int = 100_000
     scaler_rows_per_class_per_chunk: int = 2_000
@@ -176,11 +177,20 @@ def _read_chunks(
 ) -> Iterator[tuple[Path, pd.DataFrame]]:
     usecols = list(columns) + ["Label"]
     for path in paths:
-        for chunk in pd.read_csv(path, usecols=lambda name: name.strip() in usecols, chunksize=chunk_size):
-            chunk.columns = chunk.columns.str.strip()
-            if "Label" not in chunk:
-                raise ValueError(f"{path} does not contain a Label column")
-            yield path, chunk
+        with warnings.catch_warnings():
+            # Duplicate header rows make pandas infer mixed types.
+            # _clean_chunk deliberately coerces numeric fields and removes them.
+            warnings.simplefilter("ignore", pd.errors.DtypeWarning)
+            reader = pd.read_csv(
+                path,
+                usecols=lambda name: name.strip() in usecols,
+                chunksize=chunk_size,
+            )
+            for chunk in reader:
+                chunk.columns = chunk.columns.str.strip()
+                if "Label" not in chunk:
+                    raise ValueError(f"{path} does not contain a Label column")
+                yield path, chunk
 
 
 def _clean_chunk(
@@ -261,6 +271,32 @@ def _class_weights(counts: Counter[str], classes: Sequence[str]) -> torch.Tensor
 def _batch_indices(length: int, batch_size: int) -> Iterator[slice]:
     for start in range(0, length, batch_size):
         yield slice(start, min(start + batch_size, length))
+
+
+def _select_validation_indices(
+    labels: np.ndarray,
+    classes: Sequence[str],
+    remaining: dict[str, int],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    selections: list[np.ndarray] = []
+    for label in classes:
+        available = remaining[label]
+        if available <= 0:
+            continue
+        indices = np.flatnonzero(labels == label)
+        if not len(indices):
+            continue
+        if len(indices) > available:
+            indices = rng.choice(indices, size=available, replace=False)
+        remaining[label] -= len(indices)
+        selections.append(indices)
+
+    if not selections:
+        return np.empty(0, dtype=np.int64)
+    selected = np.concatenate(selections)
+    rng.shuffle(selected)
+    return selected
 
 
 def _train_epoch(
@@ -354,21 +390,10 @@ def _collect_validation(
     with torch.inference_mode():
         for _, chunk in _read_chunks(files, feature_columns, config.chunk_size):
             values, labels = _clean_chunk(chunk, feature_columns)
-            selections: list[np.ndarray] = []
-            for label in classes:
-                available = remaining[label]
-                if available <= 0:
-                    continue
-                indices = np.flatnonzero(labels == label)
-                if len(indices) > available:
-                    indices = rng.choice(indices, size=available, replace=False)
-                remaining[label] -= len(indices)
-                selections.append(indices)
-            if not selections:
+            selected = _select_validation_indices(labels, classes, remaining, rng)
+            if not len(selected):
                 continue
 
-            selected = np.concatenate(selections)
-            rng.shuffle(selected)
             values, labels = values[selected], labels[selected]
             values = scaler.transform(values).astype(np.float32)
             targets = np.fromiter(

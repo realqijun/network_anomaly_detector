@@ -144,7 +144,12 @@ class AnomalyDetector:
                 raise ValueError("Cannot determine input dimension. Provide feature_columns or ensure scaler has n_features_in_.")
 
             self.model = Autoencoder(self.input_dim)
-            self.model.load_state_dict(torch.load(self.model_path))
+            state_dict = torch.load(
+                self.model_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.model.load_state_dict(state_dict)
             self.model.eval()
             print(f"Loaded model from {self.model_path}")
 

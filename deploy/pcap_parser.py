@@ -2,7 +2,9 @@ import pandas as pd
 import os
 import sys
 import subprocess
-import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 CICFLOWMETER_CMD = "cicflowmeter"
 
@@ -60,6 +62,7 @@ MAPPING_CLI_TO_MODEL_FEATURES = {
     'urg_flag_cnt': 'URG Flag Count',
     # CWR Flag Count vs CWE Flag Count, often related/aliased. Verify.
     'cwr_flag_count': 'CWE Flag Count',
+    'cwe_flag_count': 'CWE Flag Count',
     'ece_flag_cnt': 'ECE Flag Count',
     'down_up_ratio': 'Down/Up Ratio',
     'pkt_size_avg': 'Average Packet Size',
@@ -116,66 +119,139 @@ EXPECTED_FEATURES_CICFLOWMETER = [
 ]
 
 
-def parse_pcap_to_dataframe(pcap_filename: str, expected_features: list) -> pd.DataFrame:
-    host_base_dir = "/tmp/pcap_data"
-    host_upload_dir = os.path.join(host_base_dir, "uploads")
-    host_output_dir = os.path.join(host_base_dir, "outputs")
+@dataclass(frozen=True)
+class FlowBatch:
+    features: pd.DataFrame
+    metadata: pd.DataFrame
 
-    output_csv_name = f"{pcap_filename}.csv"
-    local_csv_path = os.path.join(host_output_dir, output_csv_name)
 
-    command = [
-        "docker", "run", "--rm",
-        "-v", f"{host_upload_dir}:/data/input",
-        "-v", f"{host_output_dir}:/data/output",
-        "cfm", "cicflowmeter",
-        "-f", f"/data/input/{pcap_filename}",
-        "-c", f"/data/output/{output_csv_name}"
-    ]
+FLOW_METADATA_ALIASES = {
+    "source_ip": ("src_ip", "Src IP", "Source IP"),
+    "destination_ip": ("dst_ip", "Dst IP", "Destination IP"),
+    "source_port": ("src_port", "Src Port", "Source Port"),
+    "destination_port": ("dst_port", "Dst Port", "Destination Port"),
+    "protocol": ("protocol", "Protocol"),
+    "timestamp": ("timestamp", "Timestamp"),
+}
+
+SECONDS_TO_MICROSECONDS_FEATURES = (
+    "Flow Duration",
+    "Flow IAT Mean",
+    "Flow IAT Std",
+    "Flow IAT Max",
+    "Flow IAT Min",
+    "Fwd IAT Total",
+    "Fwd IAT Mean",
+    "Fwd IAT Std",
+    "Fwd IAT Max",
+    "Fwd IAT Min",
+    "Bwd IAT Total",
+    "Bwd IAT Mean",
+    "Bwd IAT Std",
+    "Bwd IAT Max",
+    "Bwd IAT Min",
+    "Active Mean",
+    "Active Std",
+    "Active Max",
+    "Active Min",
+    "Idle Mean",
+    "Idle Std",
+    "Idle Max",
+    "Idle Min",
+)
+
+
+def _extract_raw_flows(pcap_path: str | Path) -> pd.DataFrame:
+    pcap_path = str(pcap_path)
+    if not os.path.isfile(pcap_path):
+        raise FileNotFoundError(f"PCAP file does not exist: {pcap_path}")
+
+    output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    output_file.close()
+    output_csv_path = output_file.name
+
+    command = [CICFLOWMETER_CMD, "-f", pcap_path, "-c", output_csv_path]
 
     try:
-        subprocess.run(command, capture_output=True, text=True, check=True, timeout=300)
+        subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=300,
+        )
 
-        if not os.path.exists(local_csv_path) or os.path.getsize(local_csv_path) == 0:
-            return pd.DataFrame(columns=expected_features)
+        if not os.path.exists(output_csv_path) or os.path.getsize(output_csv_path) == 0:
+            return pd.DataFrame()
 
-        df_flows = pd.read_csv(local_csv_path)
+        df_flows = pd.read_csv(output_csv_path)
         df_flows.columns = df_flows.columns.str.strip()
+        return df_flows
 
-        reverse_mapping = {cli_name: model_name for cli_name, model_name in MAPPING_CLI_TO_MODEL_FEATURES.items()}
-        cols_to_rename = {col: reverse_mapping[col] for col in df_flows.columns if col in reverse_mapping}
-        df_flows.rename(columns=cols_to_rename, inplace=True)
-
-        if 'Fwd Header Length' in df_flows.columns and 'Fwd Header Length.1' in expected_features:
-            df_flows['Fwd Header Length.1'] = df_flows['Fwd Header Length']
-
-        for col in expected_features:
-            if col not in df_flows.columns:
-                df_flows[col] = 0
-
-        return df_flows[expected_features]
-
-    except Exception as e:
-        print(f"Error during processing: {e}")
-        return pd.DataFrame(columns=expected_features)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        raise RuntimeError(f"CICFlowMeter failed: {detail}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("CICFlowMeter exceeded the 300 second processing limit") from exc
     finally:
-        # Cleanup file, but DON'T return anything here
-        if os.path.exists(local_csv_path):
-            os.remove(local_csv_path)
+        if os.path.exists(output_csv_path):
+            os.remove(output_csv_path)
+
+
+def _standardize_flow_metadata(raw_flows: pd.DataFrame) -> pd.DataFrame:
+    metadata: dict[str, pd.Series] = {}
+    for standard_name, aliases in FLOW_METADATA_ALIASES.items():
+        source_name = next((name for name in aliases if name in raw_flows), None)
+        if source_name is None:
+            raise ValueError(
+                f"CICFlowMeter output is missing flow metadata: {standard_name}"
+            )
+        metadata[standard_name] = raw_flows[source_name]
+    return pd.DataFrame(metadata).reset_index(drop=True)
+
+
+def parse_pcap_to_flow_batch(
+    pcap_path: str | Path,
+    expected_features: list[str] | None = None,
+) -> FlowBatch:
+    expected_features = expected_features or EXPECTED_FEATURES_CICFLOWMETER
+    raw_flows = _extract_raw_flows(pcap_path)
+    if raw_flows.empty:
+        return FlowBatch(
+            features=pd.DataFrame(columns=expected_features),
+            metadata=pd.DataFrame(columns=FLOW_METADATA_ALIASES),
+        )
+
+    metadata = _standardize_flow_metadata(raw_flows)
+    features = raw_flows.rename(columns=MAPPING_CLI_TO_MODEL_FEATURES).copy()
+    if "Fwd Header Length" in features and "Fwd Header Length.1" in expected_features:
+        features["Fwd Header Length.1"] = features["Fwd Header Length"]
+
+    missing = [column for column in expected_features if column not in features]
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise ValueError(
+            f"CICFlowMeter output is missing required model features: {preview}{suffix}"
+        )
+    for column in SECONDS_TO_MICROSECONDS_FEATURES:
+        if column in features:
+            features[column] = pd.to_numeric(features[column], errors="coerce") * 1_000_000
+    return FlowBatch(
+        features=features.loc[:, expected_features].reset_index(drop=True),
+        metadata=metadata,
+    )
+
+
+def parse_pcap_to_dataframe(pcap_path: str, expected_features: list) -> pd.DataFrame:
+    return parse_pcap_to_flow_batch(pcap_path, expected_features).features
 
 
 if __name__ == '__main__':
     test_pcap = "dhcp.pcap"
-    host_upload_dir = "/tmp/pcap_data/uploads"
-
     if not os.path.exists(test_pcap):
         print(f"Error: {test_pcap} not found in current directory.")
         sys.exit(1)
-
-    # Move the test file to the shared volume
-    # In a web app, this is where you'd save the uploaded file
-    os.makedirs(host_upload_dir, exist_ok=True)
-    shutil.copy(test_pcap, os.path.join(host_upload_dir, test_pcap))
 
     try:
         df_parsed = parse_pcap_to_dataframe(test_pcap, EXPECTED_FEATURES_CICFLOWMETER)
