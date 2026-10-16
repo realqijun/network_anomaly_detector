@@ -1,16 +1,20 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, jsonify, render_template, request, redirect, url_for, flash
+import io
 import os
 import sys
 import tempfile
 
+import pandas as pd
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from anomaly_detector_service import ConvAutoencoder, EXPECTED_FEATURES_CICFLOWMETER
+from anomaly_detector_service import AnomalyDetector, EXPECTED_FEATURES_CICFLOWMETER
 from pcap_parser import parse_pcap_to_dataframe
+from wireshark_api import create_wireshark_blueprint
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24).hex()
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 
 detector = None
 
@@ -18,19 +22,26 @@ def load_detector():
     global detector
     if detector is None:
         try:
-            detector = ConvAutoencoder(feature_columns=EXPECTED_FEATURES_CICFLOWMETER)
+            detector = AnomalyDetector(feature_columns=EXPECTED_FEATURES_CICFLOWMETER)
             print("AnomalyDetector initialized successfully for Flask app.")
         except Exception as e:
             print(f"Error initializing AnomalyDetector: {e}. Please ensure 'working/' directory and models exist.")
             detector = None # Ensure detector is None if init fails
 
 load_detector()
+app.register_blueprint(create_wireshark_blueprint(lambda: detector))
 
 @app.route('/')
 def index():
     if detector is None:
         flash("Detector not loaded. Check server logs for errors.", "danger")
     return render_template('index.html')
+
+
+@app.route('/health')
+def health():
+    status = 200 if detector is not None else 503
+    return jsonify(status="ok" if detector is not None else "unavailable"), status
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -55,17 +66,21 @@ def predict():
 
     tmp_pcap_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
-            file.save(tmp_file.name)
-            tmp_pcap_path = tmp_file.name
+        if file_extension == 'csv':
+            df_to_predict = pd.read_csv(io.BytesIO(file.read()))
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
+                file.save(tmp_file.name)
+                tmp_pcap_path = tmp_file.name
 
-        pcap_output_dir = os.path.join(app.root_path, 'temp_pcap_output')
-        os.makedirs(pcap_output_dir, exist_ok=True)
-        df_to_predict = parse_pcap_to_dataframe(tmp_pcap_path, pcap_output_dir, EXPECTED_FEATURES_CICFLOWMETER)
+            df_to_predict = parse_pcap_to_dataframe(
+                tmp_pcap_path,
+                EXPECTED_FEATURES_CICFLOWMETER,
+            )
 
-        if df_to_predict.empty:
-            flash("PCAP file parsed, but no valid network flows were extracted.", "warning")
-            return redirect(url_for('index'))
+            if df_to_predict.empty:
+                flash("PCAP file parsed, but no valid network flows were extracted.", "warning")
+                return redirect(url_for('index'))
 
         # Ensure all expected feature columns are present, fill missing ones with 0 if they were not in the parsed data
         # This is important if the PCAP parser doesn't output all 78 features for some reason.
@@ -108,4 +123,4 @@ if __name__ == '__main__':
         os.makedirs('working')
         print("Created 'working/' directory. Please ensure models and scaler are in it.")
 
-    app.run()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '8080')))

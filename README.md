@@ -47,6 +47,27 @@ The model was trained using the Intrusion detection evaluation dataset (CIC-IDS2
 
 **If you have any enquiries, or suggestions, I would love it hear it! Kindly reach out to me**
 
+### Run the deployment container
+
+The deployment image contains the published model bundle and runs its startup,
+CSV-upload, and PCAP-upload checks while building:
+
+```sh
+./deploy.sh
+docker run --rm -e PORT=8080 -p 127.0.0.1:8080:8080 network-anomaly-detector:local
+```
+
+Open `http://localhost:8080` to analyze a CSV, PCAP, or PCAPNG file. The
+container also exposes `GET /health` for hosting-platform readiness checks and
+honors the platform-provided `PORT` environment variable.
+
+### Analyze a capture in Wireshark
+
+The repository includes a Lua plugin that submits the open capture to the local
+server and adds filterable anomaly fields to packets in each scored flow.
+
+See [the Wireshark plugin guide](wireshark/README.md) for installation and use.
+
 ### Train on Google Colab
 
 Open [the Colab training notebook](notebooks/train_cse_cic_ids2018_colab.ipynb),
